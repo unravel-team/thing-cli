@@ -1,0 +1,36 @@
+{
+  "name": "@unravel-tech/thing",
+  "publishConfig": {
+    "access": "public"
+  },
+  "version": "0.2.0",
+  "description": "CLI for thing: push, version, and share artifacts (HTML, Markdown, images, PDFs) from coding agents.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/unravel-team/thing-cli.git"
+  },
+  "homepage": "https://github.com/unravel-team/thing-cli",
+  "type": "module",
+  "bin": {
+    "thing": "./src/index.js"
+  },
+  "files": [
+    "src/index.js",
+    "README.md"
+  ],
+  "keywords": [
+    "artifacts",
+    "html",
+    "markdown",
+    "cli",
+    "agents",
+    "claude-code"
+  ],
+  "scripts": {
+    "typecheck": "node --input-type=module -e \"await import('./src/index.js'); console.log('ok')\""
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
