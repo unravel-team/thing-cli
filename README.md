@@ -23,6 +23,7 @@ thing push chart.png --json          # images and PDFs too
 | `thing versions <name>` | Version history for an artifact |
 | `thing rollback <name> <n>` | Point latest back to version n |
 | `thing open <name>` | Open the artifact in a browser |
+| `thing mcp` | Run a Model Context Protocol server over stdio (tools: `push_artifact`, `list_artifacts`, `whoami`) |
 
 Every command accepts `--json` for machine-readable output.
 
@@ -34,5 +35,13 @@ Which team a push lands in is decided in order: `--team` flag → `.thing.json` 
 working directory → a local `thing use` override → your **server-side default**
 (`thing default`) → your personal space. Login no longer pins a team, so with none of
 the overrides set the server picks your default (e.g. the Unravel org for Unravel members).
+
+## MCP
+
+Any MCP client can push artifacts through your CLI login — register the server as:
+
+```json
+{ "command": "thing", "args": ["mcp"] }
+```
 
 Requires Node >= 18 or Bun. No runtime dependencies.

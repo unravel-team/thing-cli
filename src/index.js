@@ -298,30 +298,24 @@ async function detail(ctx, artifact) {
   return api(ctx, `/api/v1/artifacts/${encodeURIComponent(artifact.id)}`);
 }
 
-async function push(parsed, state, io) {
-  const [file] = parsed.positionals;
-  if (!file) throw new CliError("Usage: thing push <file.html|.md|.pdf|.png|.jpg|.gif|.webp> [--name x] [--team t] [--project p] [--visibility team|public]");
-  const ctx = context(state, parsed.flags);
-  requireToken(ctx);
-  const path = resolve(file);
-  if (!existsSync(path)) throw new CliError(`File not found: ${file}`);
-
+// HTML rides as text; Markdown and media ride as base64 bytes with their real
+// filename so the server can derive the content-type from the extension.
+function docFromFile(path) {
+  if (!existsSync(path)) throw new CliError(`File not found: ${path}`);
   const ext = extname(path).toLowerCase();
   const isHtml = ext === ".html" || ext === ".htm";
   const isMarkdown = ext === ".md" || ext === ".markdown";
   if (!isHtml && !isMarkdown && !MEDIA_EXTS.has(ext)) {
-    throw new CliError(`Unsupported file type: ${ext || file}. Push an HTML page, a Markdown file, or a pdf/png/jpg/gif/webp file.`);
+    throw new CliError(`Unsupported file type: ${ext || path}. Push an HTML page, a Markdown file, or a pdf/png/jpg/gif/webp file.`);
   }
-  const name = parsed.flags.name || titleFromFile(path);
-  const visibility = parsed.flags.visibility;
-  if (visibility && !VISIBILITIES.has(visibility)) throw new CliError("Invalid visibility. Use team or public.");
-
-  // HTML rides as text; Markdown and media ride as base64 bytes with their real
-  // filename so the server can derive the content-type from the extension.
-  const doc = isHtml
+  return isHtml
     ? { filename: "index.html", html: readFileSync(path, "utf8") }
     : { filename: basename(path), contentBase64: readFileSync(path).toString("base64") };
+}
 
+async function pushToServer(ctx, { doc, name, visibility }) {
+  requireToken(ctx);
+  if (visibility && !VISIBILITIES.has(visibility)) throw new CliError("Invalid visibility. Use team or public.");
   const pushed = await api(ctx, "/api/v1/artifacts", {
     method: "POST",
     body: {
@@ -333,14 +327,28 @@ async function push(parsed, state, io) {
       ...doc
     }
   });
-  const result = {
+  return {
     artifact: pushed.artifact,
     version: pushed.version,
     url: pushed.artifact.url,
     visibility: pushed.artifact.visibility,
     tokenedUrl: null
   };
-  output(io, parsed.json, result, pushed.artifact.url);
+}
+
+async function push(parsed, state, io) {
+  const [file] = parsed.positionals;
+  if (!file) throw new CliError("Usage: thing push <file.html|.md|.pdf|.png|.jpg|.gif|.webp> [--name x] [--team t] [--project p] [--visibility team|public]");
+  const ctx = context(state, parsed.flags);
+  requireToken(ctx);
+  const path = resolve(file);
+  const doc = docFromFile(path);
+  const result = await pushToServer(ctx, {
+    doc,
+    name: parsed.flags.name || titleFromFile(path),
+    visibility: parsed.flags.visibility
+  });
+  output(io, parsed.json, result, result.url);
 }
 
 async function versionsCommand(parsed, state, io) {
@@ -389,6 +397,138 @@ async function openCommand(parsed, state, io) {
   output(io, parsed.json, { url, artifact }, url);
 }
 
+// --- MCP server (`thing mcp`) ---------------------------------------------
+// Newline-delimited JSON-RPC 2.0 over stdio, per the Model Context Protocol.
+// Zero dependencies: three tools that reuse the CLI's own auth and push path,
+// so any MCP client (Claude Code, Cursor, a desktop assistant) can publish
+// artifacts through the user's existing `thing login`.
+
+const MCP_TOOLS = [
+  {
+    name: "push_artifact",
+    description:
+      "Publish a file as a thing artifact and get a live, shareable URL. Every push creates a new immutable version. Pass either `path` (any supported file: html, md, pdf, png, jpg, gif, webp) or inline `content` with a `filename` (html or md).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Path to the file to push" },
+        content: { type: "string", description: "Inline document text (HTML or Markdown) — use with filename" },
+        filename: { type: "string", description: "Filename for inline content, e.g. report.html or notes.md" },
+        name: { type: "string", description: "Artifact name (defaults to the filename)" },
+        team: { type: "string", description: "Team slug to push to (defaults to the user's default team)" },
+        project: { type: "string", description: "Project slug" },
+        visibility: { type: "string", enum: ["team", "public"], description: "Who can see it" }
+      }
+    }
+  },
+  {
+    name: "list_artifacts",
+    description: "List the artifacts the logged-in user can see, with team, visibility, and title.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        team: { type: "string", description: "Only artifacts in this team slug" },
+        project: { type: "string", description: "Only artifacts in this project" }
+      }
+    }
+  },
+  {
+    name: "whoami",
+    description: "Show the logged-in thing user, the server, and where pushes land by default.",
+    inputSchema: { type: "object", properties: {} }
+  }
+];
+
+async function mcpTool(state, parsed, name, args) {
+  const ctx = context(state, {
+    ...parsed.flags,
+    ...(args.team ? { team: args.team } : {}),
+    ...(args.project ? { project: args.project } : {})
+  });
+  if (name === "whoami") {
+    requireToken(ctx);
+    const data = await api(ctx, "/api/v1/whoami");
+    return { user: data.user, server: ctx.server, defaultTeam: data.defaultTeam?.slug ?? null };
+  }
+  if (name === "list_artifacts") {
+    requireToken(ctx);
+    const data = await api(ctx, "/api/v1/artifacts");
+    let artifacts = data.artifacts || [];
+    if (ctx.team) artifacts = artifacts.filter((a) => a.teamSlug === ctx.team);
+    if (ctx.project) artifacts = artifacts.filter((a) => a.projectSlug === ctx.project);
+    return { artifacts };
+  }
+  if (name === "push_artifact") {
+    requireToken(ctx);
+    let doc;
+    let fallbackName;
+    if (args.path) {
+      const path = resolve(String(args.path));
+      doc = docFromFile(path);
+      fallbackName = titleFromFile(path);
+    } else if (args.content && args.filename) {
+      const ext = extname(String(args.filename)).toLowerCase();
+      if (ext === ".html" || ext === ".htm") doc = { filename: "index.html", html: String(args.content) };
+      else if (ext === ".md" || ext === ".markdown") doc = { filename: basename(String(args.filename)), contentBase64: Buffer.from(String(args.content)).toString("base64") };
+      else throw new CliError("Inline content must be .html or .md; push binaries via `path`.");
+      fallbackName = titleFromFile(String(args.filename));
+    } else {
+      throw new CliError("Provide either `path`, or `content` plus `filename`.");
+    }
+    return pushToServer(ctx, { doc, name: args.name || fallbackName, visibility: args.visibility });
+  }
+  throw new CliError(`Unknown tool: ${name}`);
+}
+
+async function mcp(parsed, state, io) {
+  const respond = (id, body) => io.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id, ...body })}\n`);
+  const handle = async (req) => {
+    if (req.method === "initialize") {
+      return {
+        protocolVersion: req.params?.protocolVersion || "2025-06-18",
+        capabilities: { tools: {} },
+        serverInfo: { name: "thing", version: "0.3.0" }
+      };
+    }
+    if (req.method === "tools/list") return { tools: MCP_TOOLS };
+    if (req.method === "ping") return {};
+    if (req.method === "tools/call") {
+      const { name, arguments: args = {} } = req.params || {};
+      try {
+        const result = await mcpTool(state, parsed, name, args);
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      } catch (error) {
+        // Tool failures are results, not protocol errors, per MCP.
+        return { content: [{ type: "text", text: error.message }], isError: true };
+      }
+    }
+    throw new CliError(`Method not found: ${req.method}`);
+  };
+
+  let buffer = "";
+  for await (const chunk of io.stdin || process.stdin) {
+    buffer += chunk.toString();
+    let newline;
+    while ((newline = buffer.indexOf("\n")) !== -1) {
+      const line = buffer.slice(0, newline).trim();
+      buffer = buffer.slice(newline + 1);
+      if (!line) continue;
+      let request;
+      try {
+        request = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (request.id === undefined || request.id === null) continue; // notification
+      try {
+        respond(request.id, { result: await handle(request) });
+      } catch (error) {
+        respond(request.id, { error: { code: -32601, message: error.message } });
+      }
+    }
+  }
+}
+
 function usage() {
   return `Usage: thing <command> [options]
 
@@ -403,6 +543,7 @@ Commands:
   versions <name>
   rollback <name> <version>
   open <name>
+  mcp                     # Model Context Protocol server over stdio
 
 Global options:
   --json
@@ -443,6 +584,9 @@ export async function run(argv = process.argv.slice(2), io = { stdout: process.s
         break;
       case "open":
         await openCommand(parsed, state, io);
+        break;
+      case "mcp":
+        await mcp(parsed, state, io);
         break;
       case "-h":
       case "--help":
