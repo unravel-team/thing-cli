@@ -6,7 +6,10 @@ import { spawn } from "node:child_process";
 import { pathToFileURL } from "node:url";
 
 const DEFAULT_SERVER = process.env.THING_SERVER || "https://usething.ai";
-let clientName = "thing-cli/0.3.0";
+// One source for the version: hardcoding it here meant the MCP handshake and
+// the analytics client header both kept reporting 0.3.0 releases later.
+const VERSION = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
+let clientName = `thing-cli/${VERSION}`;
 const VISIBILITIES = new Set(["team", "public"]);
 
 class CliError extends Error {
@@ -490,14 +493,14 @@ async function mcpTool(state, parsed, name, args) {
 }
 
 async function mcp(parsed, state, io) {
-  clientName = "thing-mcp/0.3.0";
+  clientName = `thing-mcp/${VERSION}`;
   const respond = (id, body) => io.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id, ...body })}\n`);
   const handle = async (req) => {
     if (req.method === "initialize") {
       return {
         protocolVersion: req.params?.protocolVersion || "2025-06-18",
         capabilities: { tools: {} },
-        serverInfo: { name: "thing", version: "0.3.0" }
+        serverInfo: { name: "thing", version: VERSION }
       };
     }
     if (req.method === "tools/list") return { tools: MCP_TOOLS };

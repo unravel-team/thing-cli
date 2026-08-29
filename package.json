@@ -36,6 +36,7 @@
     "cursor"
   ],
   "scripts": {
+    "smoke": "node test/cli-smoke.mjs",
     "typecheck": "node --input-type=module -e \"await import('./src/index.js'); console.log('ok')\""
   },
   "engines": {
