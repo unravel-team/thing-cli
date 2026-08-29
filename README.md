@@ -3,22 +3,22 @@
 CLI for [thing](https://usething.ai): push, version, and share artifacts (HTML pages, Markdown docs, standalone images and PDFs) from coding agents.
 
 ```sh
-npm i -g @unravel-tech/thing         # or: bun i -g @unravel-tech/thing
-thing login                          # defaults to https://usething.ai
-thing push report.html --json
-thing push notes.md --json           # Markdown gets a styled reader view
-thing push chart.png --json          # images and PDFs too
+npx -y @unravel-tech/thing push report.html
 ```
+
+That first push opens browser approval, waits for sign-in, then resumes and
+prints the durable URL. Markdown, images, and PDFs work the same way. Install
+globally if you use it often: `npm i -g @unravel-tech/thing`.
 
 ## Commands
 
 | Command | What it does |
 | --- | --- |
-| `thing login [--server url]` | Device-code login; stores a token (does not pin a team) |
+| `thing login [--server url] [--no-browser]` | Explicit device-code login; opens browser approval and stores a token |
 | `thing logout` / `thing whoami` | Clear / show the current identity and where pushes land |
 | `thing default [team] [--clear]` | Show or set your server-side default push target (used when no `--team` is given, from any machine) |
 | `thing use <team> [project]` | Set a local active team/project override for this machine |
-| `thing push <file.html\|.md\|.pdf\|.png\|.jpg\|.gif\|.webp> [--name x] [--team t] [--project p] [--visibility v]` | Push a new immutable version (HTML, Markdown, or image/PDF), print the served URL |
+| `thing push <file.html\|.md\|.pdf\|.png\|.jpg\|.gif\|.webp> [--name x] [--team t] [--project p] [--visibility v]` | Authenticate if needed, then push a new immutable version and print the served URL |
 | `thing list` | List artifacts you can see |
 | `thing versions <name>` | Version history for an artifact |
 | `thing rollback <name> <n>` | Point latest back to version n |
@@ -26,6 +26,9 @@ thing push chart.png --json          # images and PDFs too
 | `thing mcp` | Run a Model Context Protocol server over stdio (tools: `push_artifact`, `list_artifacts`, `whoami`) |
 
 Every command accepts `--json` for machine-readable output.
+An unauthenticated `push --json` emits newline-delimited authentication status;
+the final JSON object is always the push result. Use `--no-login` to fail fast
+instead of starting interactive authentication, such as in CI.
 
 Visibility values: `private`, `team`, `anyone-with-link` (prints a tokened share URL), `public`.
 

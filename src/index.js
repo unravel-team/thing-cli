@@ -112,7 +112,7 @@ function context(state, flags = {}) {
 }
 
 function requireToken(ctx) {
-  if (!ctx.token) throw new CliError("Not logged in. Run `thing login` first.");
+  if (!ctx.token) throw new CliError("Not logged in. Run `thing login`, or remove `--no-login` to authenticate during push.");
 }
 
 function slugify(input) {
@@ -177,10 +177,35 @@ async function sleep(ms) {
   await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function login(parsed, state, io) {
-  const server = stripSlash(parsed.flags.server || state.global.server || DEFAULT_SERVER);
-  const device = await api({ server }, "/api/v1/auth/device/code", { method: "POST", body: {} });
-  const loginMessage = `Open ${device.verification_uri_complete || device.verification_uri}\nEnter code: ${device.user_code}`;
+function openerCommand(url) {
+  if (process.platform === "darwin") return ["open", [url]];
+  if (process.platform === "win32") return ["cmd", ["/c", "start", "", url]];
+  return ["xdg-open", [url]];
+}
+
+function openBrowser(url) {
+  try {
+    const [cmd, args] = openerCommand(url);
+    const child = spawn(cmd, args, { stdio: "ignore", detached: true });
+    // A missing desktop opener should not end the login flow: the URL is also
+    // printed, so headless and SSH users still have a path forward.
+    child.on("error", () => {});
+    child.unref();
+  } catch {
+    // Best effort only; the printed URL is the fallback.
+  }
+}
+
+async function login(parsed, state, io, options = {}) {
+  const server = context(state, parsed.flags).server;
+  const device = await api({ server }, "/api/v1/auth/device/code", {
+    method: "POST",
+    body: { intent: options.intent || "login" }
+  });
+  const verificationUrl = device.verification_uri_complete || device.verification_uri;
+  const env = state.env ?? process.env;
+  const shouldOpenBrowser = !parsed.flags["no-browser"] && env.THING_NO_BROWSER !== "1";
+  const loginMessage = `${shouldOpenBrowser ? "Opening" : "Open"} ${verificationUrl}\nEnter code: ${device.user_code}\nWaiting for approval...`;
   output(io, parsed.json, {
     server,
     verificationUri: device.verification_uri,
@@ -189,9 +214,10 @@ async function login(parsed, state, io) {
     expiresIn: device.expires_in,
     interval: device.interval
   }, loginMessage);
+  if (shouldOpenBrowser) openBrowser(verificationUrl);
 
   const deadline = Date.now() + (Number(device.expires_in || 900) * 1000);
-  const interval = Math.max(250, Number(process.env.THING_POLL_INTERVAL_MS || Math.max(1, Number(device.interval || 5)) * 1000));
+  const interval = Math.max(250, Number(env.THING_POLL_INTERVAL_MS || Math.max(1, Number(device.interval || 5)) * 1000));
   let tokenResult = null;
   while (Date.now() < deadline) {
     await sleep(interval);
@@ -231,6 +257,15 @@ async function login(parsed, state, io) {
     user: whoami.user,
     defaultTeam
   }, `Logged in as ${whoami.user.email}${defaultTeam ? ` (pushes default to ${defaultTeam})` : ""}`);
+
+  return context(state, parsed.flags);
+}
+
+async function pushContext(parsed, state, io) {
+  const ctx = context(state, parsed.flags);
+  if (ctx.token) return ctx;
+  if (parsed.flags["no-login"]) requireToken(ctx);
+  return login(parsed, state, io, { intent: "push" });
 }
 
 async function logout(parsed, state, io) {
@@ -356,10 +391,10 @@ async function pushToServer(ctx, { doc, name, visibility }) {
 async function push(parsed, state, io) {
   const [file] = parsed.positionals;
   if (!file) throw new CliError("Usage: thing push <file.html|.md|.pdf|.png|.jpg|.gif|.webp> [--name x] [--team t] [--project p] [--visibility team|public]");
-  const ctx = context(state, parsed.flags);
-  requireToken(ctx);
   const path = resolve(file);
   const doc = docFromFile(path);
+  if (parsed.flags.visibility && !VISIBILITIES.has(parsed.flags.visibility)) throw new CliError("Invalid visibility. Use team or public.");
+  const ctx = await pushContext(parsed, state, io);
   const result = await pushToServer(ctx, {
     doc,
     name: parsed.flags.name || titleFromFile(path),
@@ -393,12 +428,6 @@ async function rollback(parsed, state, io) {
   output(io, parsed.json, { artifact, ...result }, `Rolled back ${artifact.teamSlug}/${artifact.slug} to v${result.latestVersion}`);
 }
 
-function openerCommand(url) {
-  if (process.platform === "darwin") return ["open", [url]];
-  if (process.platform === "win32") return ["cmd", ["/c", "start", "", url]];
-  return ["xdg-open", [url]];
-}
-
 async function openCommand(parsed, state, io) {
   const [name] = parsed.positionals;
   if (!name) throw new CliError("Usage: thing open <name>");
@@ -407,9 +436,7 @@ async function openCommand(parsed, state, io) {
   const artifact = await resolveArtifact(ctx, name);
   const url = `${ctx.server}/${artifact.teamSlug}/${artifact.slug}`;
   if (!parsed.json && !parsed.flags["no-browser"]) {
-    const [cmd, args] = openerCommand(url);
-    const child = spawn(cmd, args, { stdio: "ignore", detached: true });
-    child.unref();
+    openBrowser(url);
   }
   output(io, parsed.json, { url, artifact }, url);
 }
@@ -553,12 +580,12 @@ function usage() {
   return `Usage: thing <command> [options]
 
 Commands:
-  login [--server url]
+  login [--server url] [--no-browser]
   logout
   whoami
   use <team> [project]
   default [team] [--clear]
-  push <file.html|.md|.pdf|.png|.jpg|.gif|.webp> [--name x] [--team t] [--project p] [--visibility team|public]
+  push <file.html|.md|.pdf|.png|.jpg|.gif|.webp> [--name x] [--team t] [--project p] [--visibility team|public] [--no-login] [--no-browser]
   list
   versions <name>
   rollback <name> <version>
