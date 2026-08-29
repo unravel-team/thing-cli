@@ -3,7 +3,7 @@
 CLI for [thing](https://usething.ai): push, version, and share artifacts (HTML pages, Markdown docs, standalone images and PDFs) from coding agents.
 
 ```sh
-npm i -g @unravel-tech/thing
+npm i -g @unravel-tech/thing         # or: bun i -g @unravel-tech/thing
 thing login                          # defaults to https://usething.ai
 thing push report.html --json
 thing push notes.md --json           # Markdown gets a styled reader view
@@ -55,6 +55,20 @@ into your client's MCP config.
 }
 ```
 
+On a machine that has Bun but no Node, swap `npx` for `bunx`:
+
+```json
+{
+  "mcpServers": {
+    "thing": {
+      "command": "bunx",
+      "args": ["-y", "@unravel-tech/thing", "mcp"],
+      "env": { "THING_TOKEN": "paste-your-token-here" }
+    }
+  }
+}
+```
+
 The server exposes three tools: `push_artifact` to publish a file or inline
 content and get back a link, `list_artifacts` to see what you have, and
 `whoami` to check which account and team you are pushing to.
@@ -62,4 +76,13 @@ content and get back a link, `list_artifacts` to see what you have, and
 If you already ran `thing login`, the stored credential is used and
 `THING_TOKEN` can be left out.
 
-Requires Node >= 18 or Bun. No runtime dependencies.
+## Runtimes
+
+Node >= 18 or Bun, no runtime dependencies. The `thing` executable launches under
+whichever of the two is on your PATH (Node first), so a global install works on a
+machine that has never installed Node:
+
+```sh
+bun i -g @unravel-tech/thing
+thing login
+```

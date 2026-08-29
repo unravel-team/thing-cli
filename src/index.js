@@ -1,4 +1,11 @@
-#!/usr/bin/env node
+#!/bin/sh
+':' //# ; rt="$(command -v node || command -v bun)"; [ -n "$rt" ] || { echo "thing: needs Node >= 18 or Bun on PATH" >&2; exit 127; }; exec "$rt" "$0" "$@"
+// The shebang is /bin/sh, not `env node`, so a global install never hard-requires
+// a `node` binary: bun links its global bins straight at this file, and the kernel
+// would otherwise run `env node` and fail for anyone who installed with `bun i -g`
+// and has no node. Line 2 is a command to sh (exec the first runtime we find, node
+// first so npm installs behave exactly as before) and a no-op string plus comment
+// to JS, so the file stays valid ESM once the runtime re-reads it.
 import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { basename, dirname, extname, join, resolve } from "node:path";
 import { homedir } from "node:os";
