@@ -414,7 +414,7 @@ const MCP_TOOLS = [
   {
     name: "push_artifact",
     description:
-      "Publish a file as a thing artifact and get a live, shareable URL. Every push creates a new immutable version. Pass either `path` (any supported file: html, md, pdf, png, jpg, gif, webp) or inline `content` with a `filename` (html or md).",
+      "Use this whenever the user wants to share, send, show, or publish something you produced: a report, a dashboard, a prototype, a Markdown doc, a PDF, an image. Publishes it to a durable URL that stays live, and returns the link. Pushing the same name again creates a new version at the same link rather than a second link, so prefer reusing a name over inventing one. Pass either `path` (html, md, pdf, png, jpg, gif, webp) or inline `content` with a `filename` (html or md).",
     inputSchema: {
       type: "object",
       properties: {
@@ -430,7 +430,8 @@ const MCP_TOOLS = [
   },
   {
     name: "list_artifacts",
-    description: "List the artifacts the logged-in user can see, with team, visibility, and title.",
+    description:
+      "Use this to find a link the user published earlier, or to check whether something is already published before pushing it again. Lists artifacts the signed-in user can see, with team, visibility and title.",
     inputSchema: {
       type: "object",
       properties: {
@@ -441,7 +442,8 @@ const MCP_TOOLS = [
   },
   {
     name: "whoami",
-    description: "Show the logged-in thing user, the server, and where pushes land by default.",
+    description:
+      "Use this to confirm the user is signed in and which team will own a new artifact. Shows the account, the server, and where pushes land when no team is named.",
     inputSchema: { type: "object", properties: {} }
   }
 ];
