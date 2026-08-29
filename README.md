@@ -1,10 +1,10 @@
 # @unravel-tech/thing
 
-CLI for [thing](https://thing.unravel.tech): push, version, and share artifacts — HTML pages, Markdown docs, standalone images and PDFs — from coding agents.
+CLI for [thing](https://usething.ai): push, version, and share artifacts (HTML pages, Markdown docs, standalone images and PDFs) from coding agents.
 
 ```sh
 npm i -g @unravel-tech/thing
-thing login                          # defaults to https://thing.unravel.tech
+thing login                          # defaults to https://usething.ai
 thing push report.html --json
 thing push notes.md --json           # Markdown gets a styled reader view
 thing push chart.png --json          # images and PDFs too
@@ -38,10 +38,28 @@ the overrides set the server picks your default (e.g. the Unravel org for Unrave
 
 ## MCP
 
-Any MCP client can push artifacts through your CLI login — register the server as:
+Claude Code, Cursor, Codex, and anything else that speaks Model Context
+Protocol can publish through thing. No terminal login needed: create a token at
+[usething.ai](https://usething.ai) under Settings, then Tokens, and paste this
+into your client's MCP config.
 
 ```json
-{ "command": "thing", "args": ["mcp"] }
+{
+  "mcpServers": {
+    "thing": {
+      "command": "npx",
+      "args": ["-y", "@unravel-tech/thing", "mcp"],
+      "env": { "THING_TOKEN": "paste-your-token-here" }
+    }
+  }
+}
 ```
+
+The server exposes three tools: `push_artifact` to publish a file or inline
+content and get back a link, `list_artifacts` to see what you have, and
+`whoami` to check which account and team you are pushing to.
+
+If you already ran `thing login`, the stored credential is used and
+`THING_TOKEN` can be left out.
 
 Requires Node >= 18 or Bun. No runtime dependencies.

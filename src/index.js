@@ -5,7 +5,8 @@ import { homedir } from "node:os";
 import { spawn } from "node:child_process";
 import { pathToFileURL } from "node:url";
 
-const DEFAULT_SERVER = process.env.THING_SERVER || "https://thing.unravel.tech";
+const DEFAULT_SERVER = process.env.THING_SERVER || "https://usething.ai";
+let clientName = "thing-cli/0.3.0";
 const VISIBILITIES = new Set(["team", "public"]);
 
 class CliError extends Error {
@@ -36,6 +37,7 @@ function projectConfigPath(cwd) {
 
 function loadState(cwd, env = process.env) {
   return {
+    env,
     globalPath: configPath(env),
     global: readJson(configPath(env)),
     projectPath: projectConfigPath(cwd),
@@ -87,9 +89,13 @@ function stripSlash(server) {
 }
 
 function context(state, flags = {}) {
+  const env = state.env ?? process.env;
   return {
-    server: stripSlash(flags.server || state.project.server || state.global.server || DEFAULT_SERVER),
-    token: flags.token || state.global.token || null,
+    // THING_SERVER and THING_TOKEN let an MCP client run this with no prior
+    // `thing login`: the whole config is a paste, which is the difference
+    // between usable and not for anyone who does not live in a terminal.
+    server: stripSlash(flags.server || env.THING_SERVER || state.project.server || state.global.server || DEFAULT_SERVER),
+    token: flags.token || env.THING_TOKEN || state.global.token || null,
     team: flags.team || state.project.team || state.global.activeTeam || null,
     project: flags.project || state.project.project || state.global.activeProject || null
   };
@@ -129,6 +135,7 @@ function formatText(value) {
 async function api(ctx, path, options = {}) {
   const headers = {
     Accept: "application/json",
+    "X-Thing-Client": clientName,
     ...(options.body ? { "Content-Type": "application/json" } : {}),
     ...(ctx.token ? { Authorization: `Bearer ${ctx.token}` } : {}),
     ...(options.headers || {})
@@ -481,6 +488,7 @@ async function mcpTool(state, parsed, name, args) {
 }
 
 async function mcp(parsed, state, io) {
+  clientName = "thing-mcp/0.3.0";
   const respond = (id, body) => io.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id, ...body })}\n`);
   const handle = async (req) => {
     if (req.method === "initialize") {
