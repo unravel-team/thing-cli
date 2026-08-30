@@ -1,0 +1,56 @@
+name: Publish MCP registry entry
+
+on:
+  schedule:
+    - cron: "37 7 * * *"
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: publish-mcp-registry
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the registry publisher
+        run: |
+          curl -sSL "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_amd64.tar.gz" \
+            | tar xz mcp-publisher
+          sudo mv mcp-publisher /usr/local/bin/
+
+      - name: Compare published versions
+        id: versions
+        run: |
+          manifest=$(python3 -c "import json;print(json.load(open('server.json'))['version'])")
+          package=$(python3 -c "import json;print(json.load(open('package.json'))['version'])")
+          npm_latest=$(npm view "@unravel-tech/thing" version)
+          registry=$(curl -sSL "https://registry.modelcontextprotocol.io/v0/servers?search=io.github.unravel-team&limit=5" \
+            | python3 -c "import sys,json;d=json.load(sys.stdin);print(next((s['server']['version'] for s in d.get('servers',[]) if s['server']['name']=='io.github.unravel-team/thing'),''))")
+
+          echo "manifest=$manifest package=$package npm=$npm_latest registry=${registry:-missing}"
+          test "$manifest" = "$package"
+          test "$manifest" = "$npm_latest"
+          npm view "@unravel-tech/thing@$manifest" version
+
+          if [ "$registry" = "$manifest" ]; then
+            echo "current=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "current=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Log in with GitHub OIDC
+        if: steps.versions.outputs.current != 'true'
+        run: mcp-publisher login github-oidc
+
+      - name: Publish
+        if: steps.versions.outputs.current != 'true'
+        run: mcp-publisher publish
