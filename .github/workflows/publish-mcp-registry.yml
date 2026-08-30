@@ -33,15 +33,15 @@ jobs:
           manifest=$(python3 -c "import json;print(json.load(open('server.json'))['version'])")
           package=$(python3 -c "import json;print(json.load(open('package.json'))['version'])")
           npm_latest=$(npm view "@unravel-tech/thing" version)
-          registry=$(curl -sSL "https://registry.modelcontextprotocol.io/v0/servers?search=io.github.unravel-team&limit=5" \
-            | python3 -c "import sys,json;d=json.load(sys.stdin);print(next((s['server']['version'] for s in d.get('servers',[]) if s['server']['name']=='io.github.unravel-team/thing'),''))")
+          registry_versions=$(curl -sSL "https://registry.modelcontextprotocol.io/v0/servers?search=io.github.unravel-team&limit=20" \
+            | python3 -c "import sys,json;d=json.load(sys.stdin);print(','.join(s['server']['version'] for s in d.get('servers',[]) if s['server']['name']=='io.github.unravel-team/thing'))")
 
-          echo "manifest=$manifest package=$package npm=$npm_latest registry=${registry:-missing}"
+          echo "manifest=$manifest package=$package npm=$npm_latest registry=${registry_versions:-missing}"
           test "$manifest" = "$package"
           test "$manifest" = "$npm_latest"
           npm view "@unravel-tech/thing@$manifest" version
 
-          if [ "$registry" = "$manifest" ]; then
+          if printf '%s\n' "$registry_versions" | tr ',' '\n' | grep -Fxq "$manifest"; then
             echo "current=true" >> "$GITHUB_OUTPUT"
           else
             echo "current=false" >> "$GITHUB_OUTPUT"
