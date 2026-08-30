@@ -9,10 +9,18 @@
 import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { basename, dirname, extname, join, resolve } from "node:path";
 import { homedir } from "node:os";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 
 const DEFAULT_SERVER = process.env.THING_SERVER || "https://usething.ai";
+const PACKAGE_NAME = "@unravel-tech/thing";
+const PACKAGE_SPEC = `${PACKAGE_NAME}@latest`;
+const UPDATE_POLICY_PATH = "/api/v1/client-policy";
+const UPDATE_CHECK_INTERVAL_MS = 60 * 60 * 1000;
+const UPDATE_NOTICE_INTERVAL_MS = 24 * 60 * 60 * 1000;
+const UPDATE_CHECK_TIMEOUT_MS = 1500;
+const UPDATE_REQUIRED_EXIT_CODE = 3;
+const UPDATE_STATUSES = new Set(["current", "update_available", "update_required"]);
 // One source for the version: hardcoding it here meant the MCP handshake and
 // the analytics client header both kept reporting 0.3.0 releases later.
 const VERSION = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
@@ -23,6 +31,16 @@ class CliError extends Error {
   constructor(message, exitCode = 1) {
     super(message);
     this.exitCode = exitCode;
+  }
+}
+
+class UpdateRequiredError extends CliError {
+  constructor(policy) {
+    const client = policy.client === "thing-mcp" ? "Thing MCP" : "Thing CLI";
+    const requiredVersion = policy.minimumVersion || policy.latestVersion;
+    super(`${client} ${VERSION} is no longer supported.${requiredVersion ? ` Version ${requiredVersion} or newer is required.` : " An update is required."}`, UPDATE_REQUIRED_EXIT_CODE);
+    this.code = "CLIENT_UPDATE_REQUIRED";
+    this.policy = policy;
   }
 }
 
@@ -111,6 +129,186 @@ function context(state, flags = {}) {
   };
 }
 
+function clientKind(name = clientName) {
+  return String(name).startsWith("thing-mcp/") ? "thing-mcp" : "thing-cli";
+}
+
+function safeVersion(value) {
+  const version = String(value || "");
+  return /^[0-9A-Za-z][0-9A-Za-z.+-]{0,63}$/.test(version) ? version : null;
+}
+
+function normalizeUpdatePolicy(value, client = clientKind()) {
+  if (!value || typeof value !== "object") return null;
+  const status = value.code === "CLIENT_UPDATE_REQUIRED" ? "update_required" : value.status;
+  if (!UPDATE_STATUSES.has(status)) return null;
+  const latestVersion = safeVersion(value.latestVersion);
+  const minimumVersion = safeVersion(value.minimumVersion);
+  if (status === "update_available" && !latestVersion) return null;
+  if (status === "update_required" && !minimumVersion && !latestVersion) return null;
+  return {
+    status,
+    client,
+    currentVersion: VERSION,
+    latestVersion,
+    minimumVersion,
+    package: PACKAGE_NAME
+  };
+}
+
+function updatePolicyOutput(policy) {
+  if (!policy) return { status: "unknown", currentVersion: VERSION, package: PACKAGE_NAME, updateCommand: updateCommand() };
+  return {
+    ...policy,
+    updateCommand: updateCommand()
+  };
+}
+
+function updateCacheKey(server, client) {
+  return `${client}|${server}`;
+}
+
+function numberFromEnv(env, name, fallback) {
+  const value = Number(env?.[name]);
+  return Number.isFinite(value) && value >= 0 ? value : fallback;
+}
+
+function saveGlobalBestEffort(state) {
+  try {
+    saveGlobal(state);
+  } catch {
+    // Update checks must never break an otherwise valid command merely because
+    // the config directory is temporarily read-only.
+  }
+}
+
+async function getUpdatePolicy(state, flags = {}, options = {}) {
+  const env = state.env ?? process.env;
+  const client = options.client || clientKind();
+  const server = context(state, flags).server;
+  const key = updateCacheKey(server, client);
+  const checks = state.global.updateChecks && typeof state.global.updateChecks === "object"
+    ? state.global.updateChecks
+    : (state.global.updateChecks = {});
+  const cached = checks[key];
+  const now = Date.now();
+  const interval = numberFromEnv(env, "THING_UPDATE_CHECK_INTERVAL_MS", UPDATE_CHECK_INTERVAL_MS);
+
+  if (!options.forceRefresh && cached && now - Number(cached.checkedAt || 0) < interval) {
+    return normalizeUpdatePolicy(cached.policy, client);
+  }
+
+  const controller = new AbortController();
+  const timeoutMs = numberFromEnv(env, "THING_UPDATE_CHECK_TIMEOUT_MS", UPDATE_CHECK_TIMEOUT_MS);
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  let policy = null;
+  try {
+    const response = await fetch(`${server}${UPDATE_POLICY_PATH}`, {
+      headers: {
+        Accept: "application/json",
+        "X-Thing-Client": `${client}/${VERSION}`
+      },
+      signal: controller.signal
+    });
+    if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+    policy = normalizeUpdatePolicy(await response.json(), client);
+  } catch {
+    // Advisory checks fail open. Required updates remain enforced by the 426
+    // response on every protected API operation.
+  } finally {
+    clearTimeout(timeout);
+  }
+
+  checks[key] = {
+    ...cached,
+    checkedAt: now,
+    policy
+  };
+  saveGlobalBestEffort(state);
+  return policy;
+}
+
+function detectedPackageManager(flags = {}) {
+  if (flags.manager) {
+    if (flags.manager !== "npm" && flags.manager !== "bun") throw new CliError("Invalid package manager. Use npm or bun.");
+    return flags.manager;
+  }
+  let invokedPath = "";
+  try {
+    invokedPath = process.argv[1] ? realpathSync(process.argv[1]) : "";
+  } catch {
+    // Fall through to the runtime check.
+  }
+  return invokedPath.includes("/.bun/") || process.versions.bun ? "bun" : "npm";
+}
+
+function updateCommand(flags = {}) {
+  const manager = detectedPackageManager(flags);
+  return manager === "bun"
+    ? `bun install --global ${PACKAGE_SPEC}`
+    : `npm install --global ${PACKAGE_SPEC}`;
+}
+
+function ephemeralInvocation() {
+  try {
+    const invokedPath = process.argv[1] ? realpathSync(process.argv[1]) : "";
+    if (/[/\\]_npx[/\\]/.test(invokedPath)) return "npx";
+    if (/[/\\]\.bun[/\\]install[/\\]cache[/\\]/.test(invokedPath)) return "bunx";
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function updateAction(surface) {
+  const ephemeral = ephemeralInvocation();
+  if (ephemeral) return `Use ${PACKAGE_SPEC} in your ${ephemeral} command, then restart the ${surface === "thing-mcp" ? "MCP client" : "command"}.`;
+  const install = `Run: ${updateCommand()}`;
+  return surface === "thing-mcp" ? `${install}\nThen restart your MCP client.` : install;
+}
+
+function updateNotice(policy, surface = policy?.client || clientKind()) {
+  const label = surface === "thing-mcp" ? "Thing MCP" : "Thing CLI";
+  if (policy?.status === "update_required") {
+    const requiredVersion = policy.minimumVersion || policy.latestVersion;
+    return `${label} ${VERSION} is no longer supported.${requiredVersion ? ` Version ${requiredVersion} or newer is required.` : " An update is required."}\n${updateAction(surface)}`;
+  }
+  if (policy?.status === "update_available") {
+    return `Update available: ${label} ${VERSION} → ${policy.latestVersion}.\n${updateAction(surface)}`;
+  }
+  return "";
+}
+
+function advisoryNoticesDisabled(parsed, state) {
+  const env = state.env ?? process.env;
+  const ci = env.CI && env.CI !== "0" && env.CI !== "false";
+  return parsed.json || ci || env.THING_NO_UPDATE_NOTICES === "1";
+}
+
+function maybeShowCliUpdate(policy, parsed, state, io) {
+  if (policy?.status !== "update_available" || advisoryNoticesDisabled(parsed, state)) return;
+  const ctx = context(state, parsed.flags);
+  const key = updateCacheKey(ctx.server, "thing-cli");
+  const checks = state.global.updateChecks || {};
+  const cached = checks[key] || {};
+  const now = Date.now();
+  const interval = numberFromEnv(state.env ?? process.env, "THING_UPDATE_NOTICE_INTERVAL_MS", UPDATE_NOTICE_INTERVAL_MS);
+  if (cached.notifiedVersion === policy.latestVersion && now - Number(cached.notifiedAt || 0) < interval) return;
+  io.stderr.write(`\n${updateNotice(policy, "thing-cli")}\n`);
+  checks[key] = { ...cached, notifiedVersion: policy.latestVersion, notifiedAt: now };
+  state.global.updateChecks = checks;
+  saveGlobalBestEffort(state);
+}
+
+function updateErrorPayload(error) {
+  if (error.code !== "CLIENT_UPDATE_REQUIRED") return { error: error.message };
+  return {
+    error: error.message,
+    code: error.code,
+    ...updatePolicyOutput(error.policy)
+  };
+}
+
 function requireToken(ctx) {
   if (!ctx.token) throw new CliError("Not logged in. Run `thing login`, or remove `--no-login` to authenticate during push.");
 }
@@ -153,7 +351,8 @@ async function api(ctx, path, options = {}) {
   const response = await fetch(`${ctx.server}${path}`, {
     method: options.method || "GET",
     headers,
-    body: options.body ? JSON.stringify(options.body) : undefined
+    body: options.body ? JSON.stringify(options.body) : undefined,
+    signal: options.signal
   });
   const text = await response.text();
   let data = null;
@@ -165,6 +364,16 @@ async function api(ctx, path, options = {}) {
     }
   }
   if (!response.ok) {
+    if (response.status === 426 && data?.code === "CLIENT_UPDATE_REQUIRED") {
+      throw new UpdateRequiredError(normalizeUpdatePolicy(data, clientKind()) || {
+        status: "update_required",
+        client: clientKind(),
+        currentVersion: VERSION,
+        latestVersion: safeVersion(data.latestVersion),
+        minimumVersion: safeVersion(data.minimumVersion),
+        package: PACKAGE_NAME
+      });
+    }
     const message = data?.error || data?.text || `${response.status} ${response.statusText}`;
     const error = new CliError(message, response.status === 401 ? 2 : 1);
     error.response = data;
@@ -441,13 +650,69 @@ async function openCommand(parsed, state, io) {
   output(io, parsed.json, { url, artifact }, url);
 }
 
+function versionCommand(parsed, io, name = "thing-cli") {
+  output(io, parsed.json, { name, version: VERSION }, `${name === "thing-mcp" ? "thing-mcp" : "thing"} ${VERSION}`);
+}
+
+async function updateCommandHandler(parsed, state, io) {
+  const force = Boolean(parsed.flags.force);
+  const manager = detectedPackageManager(parsed.flags);
+  const command = updateCommand({ manager });
+
+  const ephemeral = ephemeralInvocation();
+  if (ephemeral && !parsed.flags.manager) {
+    output(io, parsed.json, {
+      ok: true,
+      action: "restart",
+      currentVersion: VERSION,
+      package: PACKAGE_NAME,
+      recommendation: `Use ${PACKAGE_SPEC} in the npx command and restart the client.`
+    }, `This copy runs through ${ephemeral}. Use ${PACKAGE_SPEC} in the ${ephemeral} command, then restart the CLI or MCP client.`);
+    return;
+  }
+
+  if (!force) {
+    const policy = await getUpdatePolicy(state, parsed.flags, { client: "thing-cli", forceRefresh: true });
+    if (policy?.status === "current") {
+      output(io, parsed.json, { ok: true, updated: false, ...updatePolicyOutput(policy) }, `Thing CLI ${VERSION} is already current.`);
+      return;
+    }
+  }
+
+  const args = ["install", "--global", PACKAGE_SPEC, ...(force && manager === "npm" ? ["--force"] : [])];
+  const runner = io.spawnSync || spawnSync;
+  const result = runner(manager, args, {
+    stdio: parsed.json ? "pipe" : "inherit",
+    encoding: "utf8"
+  });
+  if (result?.error) throw new CliError(`Could not run ${manager}: ${result.error.message}`);
+  if (result?.status !== 0) {
+    const detail = parsed.json ? String(result?.stderr || result?.stdout || "").trim() : "";
+    throw new CliError(`Update failed with ${manager}${detail ? `: ${detail}` : "."}`);
+  }
+  output(io, parsed.json, {
+    ok: true,
+    updated: true,
+    forced: force,
+    previousVersion: VERSION,
+    package: PACKAGE_NAME,
+    command
+  }, `Installed ${PACKAGE_SPEC}. Restart Thing${clientKind() === "thing-mcp" ? " and your MCP client" : ""} to use the new version.`);
+}
+
 // --- MCP server (`thing mcp`) ---------------------------------------------
 // Newline-delimited JSON-RPC 2.0 over stdio, per the Model Context Protocol.
-// Zero dependencies: three tools that reuse the CLI's own auth and push path,
+// Zero dependencies: four tools that reuse the CLI's own auth and push path,
 // so any MCP client (Claude Code, Cursor, a desktop assistant) can publish
 // artifacts through the user's existing `thing login`.
 
 const MCP_TOOLS = [
+  {
+    name: "server_info",
+    description:
+      "Reports the installed Thing MCP version and whether the Thing server recommends or requires an update. This tool remains available when other tools require a newer client.",
+    inputSchema: { type: "object", properties: {} }
+  },
   {
     name: "push_artifact",
     description:
@@ -485,7 +750,14 @@ const MCP_TOOLS = [
   }
 ];
 
-async function mcpTool(state, parsed, name, args) {
+async function mcpTool(state, parsed, name, args, runtime = {}) {
+  if (name === "server_info") {
+    return {
+      name: "thing-mcp",
+      version: VERSION,
+      update: updatePolicyOutput(runtime.updatePolicy)
+    };
+  }
   const ctx = context(state, {
     ...parsed.flags,
     ...(args.team ? { team: args.team } : {}),
@@ -529,27 +801,74 @@ async function mcpTool(state, parsed, name, args) {
 async function mcp(parsed, state, io) {
   clientName = `thing-mcp/${VERSION}`;
   const respond = (id, body) => io.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id, ...body })}\n`);
+  const notify = (method, params) => io.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", method, params })}\n`);
+  const logLevels = ["debug", "info", "notice", "warning", "error", "critical", "alert", "emergency"];
+  let updatePolicy = null;
+  let advisoryDelivered = false;
+  let logLevel = "notice";
   const handle = async (req) => {
     if (req.method === "initialize") {
-      return {
+      updatePolicy = await getUpdatePolicy(state, parsed.flags, { client: "thing-mcp", forceRefresh: true });
+      const result = {
         protocolVersion: req.params?.protocolVersion || "2025-06-18",
-        capabilities: { tools: {} },
+        capabilities: { tools: {}, logging: {} },
         serverInfo: { name: "thing", version: VERSION }
       };
+      const instructions = updateNotice(updatePolicy, "thing-mcp");
+      if (instructions) result.instructions = instructions;
+      return result;
     }
     if (req.method === "tools/list") return { tools: MCP_TOOLS };
     if (req.method === "ping") return {};
+    if (req.method === "logging/setLevel") {
+      const requested = req.params?.level;
+      if (!logLevels.includes(requested)) {
+        const error = new CliError(`Invalid log level: ${requested}`);
+        error.rpcCode = -32602;
+        throw error;
+      }
+      logLevel = requested;
+      return {};
+    }
     if (req.method === "tools/call") {
       const { name, arguments: args = {} } = req.params || {};
       try {
-        const result = await mcpTool(state, parsed, name, args);
-        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+        if (name !== "server_info" && updatePolicy?.status === "update_required") {
+          throw new UpdateRequiredError(updatePolicy);
+        }
+        const result = await mcpTool(state, parsed, name, args, { updatePolicy });
+        const content = [{ type: "text", text: JSON.stringify(result, null, 2) }];
+        if (name !== "server_info" && updatePolicy?.status === "update_available" && !advisoryDelivered) {
+          content.push({ type: "text", text: updateNotice(updatePolicy, "thing-mcp") });
+          advisoryDelivered = true;
+        }
+        return { content };
       } catch (error) {
+        if (error.code === "CLIENT_UPDATE_REQUIRED") updatePolicy = error.policy;
         // Tool failures are results, not protocol errors, per MCP.
-        return { content: [{ type: "text", text: error.message }], isError: true };
+        return {
+          content: [{ type: "text", text: error.code === "CLIENT_UPDATE_REQUIRED" ? updateNotice(error.policy, "thing-mcp") : error.message }],
+          ...(error.code === "CLIENT_UPDATE_REQUIRED" ? { structuredContent: updateErrorPayload(error) } : {}),
+          isError: true
+        };
       }
     }
     throw new CliError(`Method not found: ${req.method}`);
+  };
+
+  const handleNotification = (notification) => {
+    if (notification.method !== "notifications/initialized" || !updatePolicy || updatePolicy.status === "current") return;
+    const level = updatePolicy.status === "update_required" ? "warning" : "notice";
+    if (logLevels.indexOf(level) < logLevels.indexOf(logLevel)) return;
+    notify("notifications/message", {
+      level,
+      logger: "thing-update",
+      data: {
+        code: updatePolicy.status === "update_required" ? "CLIENT_UPDATE_REQUIRED" : "CLIENT_UPDATE_AVAILABLE",
+        message: updateNotice(updatePolicy, "thing-mcp"),
+        ...updatePolicyOutput(updatePolicy)
+      }
+    });
   };
 
   let buffer = "";
@@ -566,11 +885,14 @@ async function mcp(parsed, state, io) {
       } catch {
         continue;
       }
-      if (request.id === undefined || request.id === null) continue; // notification
+      if (request.id === undefined || request.id === null) {
+        handleNotification(request);
+        continue;
+      }
       try {
         respond(request.id, { result: await handle(request) });
       } catch (error) {
-        respond(request.id, { error: { code: -32601, message: error.message } });
+        respond(request.id, { error: { code: error.rpcCode || -32601, message: error.message } });
       }
     }
   }
@@ -580,6 +902,8 @@ function usage() {
   return `Usage: thing <command> [options]
 
 Commands:
+  version
+  update [--force] [--manager npm|bun]
   login [--server url] [--no-browser]
   logout
   whoami
@@ -590,9 +914,10 @@ Commands:
   versions <name>
   rollback <name> <version>
   open <name>
-  mcp                     # Model Context Protocol server over stdio
+  mcp [--version]         # Model Context Protocol server over stdio
 
 Global options:
+  --version, -V
   --json
 `;
 }
@@ -600,8 +925,28 @@ Global options:
 export async function run(argv = process.argv.slice(2), io = { stdout: process.stdout, stderr: process.stderr, cwd: process.cwd(), env: process.env }) {
   const parsed = parseArgv(argv);
   const state = loadState(io.cwd || process.cwd(), io.env || process.env);
+  clientName = parsed.command === "mcp" ? `thing-mcp/${VERSION}` : `thing-cli/${VERSION}`;
   try {
+    if (parsed.command === "mcp" && parsed.flags.version) {
+      versionCommand(parsed, io, "thing-mcp");
+      return 0;
+    }
+
+    const localCommands = new Set([undefined, "-h", "--help", "-V", "--version", "version", "update", "mcp"]);
+    const policy = localCommands.has(parsed.command)
+      ? null
+      : await getUpdatePolicy(state, parsed.flags, { client: "thing-cli" });
+    if (policy?.status === "update_required") throw new UpdateRequiredError(policy);
+
     switch (parsed.command) {
+      case "version":
+      case "-V":
+      case "--version":
+        versionCommand(parsed, io);
+        break;
+      case "update":
+        await updateCommandHandler(parsed, state, io);
+        break;
       case "login":
         await login(parsed, state, io);
         break;
@@ -643,12 +988,13 @@ export async function run(argv = process.argv.slice(2), io = { stdout: process.s
       default:
         throw new CliError(`Unknown command: ${parsed.command}\n${usage()}`);
     }
+    maybeShowCliUpdate(policy, parsed, state, io);
     return 0;
   } catch (error) {
     if (parsed.json) {
-      io.stdout.write(`${JSON.stringify({ error: error.message })}\n`);
+      io.stdout.write(`${JSON.stringify(updateErrorPayload(error))}\n`);
     } else {
-      io.stderr.write(`${error.message}\n`);
+      io.stderr.write(`${error.code === "CLIENT_UPDATE_REQUIRED" ? updateNotice(error.policy, "thing-cli") : error.message}\n`);
     }
     return error.exitCode || 1;
   }

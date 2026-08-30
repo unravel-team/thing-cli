@@ -3,7 +3,7 @@
   "publishConfig": {
     "access": "public"
   },
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Artifacts for any coding agent. Publish what Claude Code, Codex, Cursor or Gemini CLI builds to a durable link, with versions and comments on the page.",
   "mcpName": "io.github.unravel-team/thing",
   "license": "MIT",
@@ -19,6 +19,7 @@
   "files": [
     "src/index.js",
     "README.md",
+    "THING_SERVER_UPDATE_POLICY.md",
     "server.json"
   ],
   "keywords": [
@@ -36,6 +37,7 @@
     "cursor"
   ],
   "scripts": {
+    "test": "node test/cli-smoke.mjs && node test/update-policy.mjs",
     "smoke": "node test/cli-smoke.mjs",
     "typecheck": "node --input-type=module -e \"await import('./src/index.js'); console.log('ok')\""
   },
