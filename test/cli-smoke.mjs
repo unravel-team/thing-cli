@@ -109,7 +109,30 @@ try {
   assert(lines.at(-1).url === "https://thing.test/personal/auto-login", "push should resume and emit the artifact URL");
   assert(deviceIntent === "push", "automatic authentication should identify push intent");
   const config = JSON.parse(readFileSync(join(home, ".config", "thing", "config.json"), "utf8"));
-  assert(config.token === "token-1", "automatic login should store the issued token");
+  assert(config.activeAccount === "cli@example.com", "automatic login should select an account named after the authenticated email");
+  assert(config.accounts["cli@example.com"].token === "token-1", "automatic login should store the issued token in the account");
+
+  let loginStdout = "";
+  let loginStderr = "";
+  const loginCode = await run([
+    "login",
+    "--account",
+    "work",
+    "--server",
+    "https://thing.test",
+    "--no-browser",
+    "--json"
+  ], {
+    cwd,
+    env,
+    stdout: { write: (chunk) => { loginStdout += String(chunk); } },
+    stderr: { write: (chunk) => { loginStderr += String(chunk); } }
+  });
+  assert(loginCode === 0, `a second named login should succeed: ${loginStderr || loginStdout}`);
+  const afterSecondLogin = JSON.parse(readFileSync(join(home, ".config", "thing", "config.json"), "utf8"));
+  assert(afterSecondLogin.activeAccount === "work", "the newest named login should become the global default");
+  assert(afterSecondLogin.accounts.work.token === "token-1", "the named login should store its credential");
+  assert(afterSecondLogin.accounts["cli@example.com"].token === "token-1", "adding an account should not overwrite earlier credentials");
 } finally {
   globalThis.fetch = originalFetch;
 }

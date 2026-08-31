@@ -3,7 +3,7 @@
   "publishConfig": {
     "access": "public"
   },
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Artifacts for any coding agent. Publish what Claude Code, Codex, Cursor or Gemini CLI builds to a durable link, with versions and comments on the page.",
   "mcpName": "io.github.unravel-team/thing",
   "license": "MIT",
@@ -37,7 +37,7 @@
     "cursor"
   ],
   "scripts": {
-    "test": "node test/cli-smoke.mjs && node test/update-policy.mjs",
+    "test": "node test/cli-smoke.mjs && node test/accounts.mjs && node test/update-policy.mjs",
     "smoke": "node test/cli-smoke.mjs",
     "typecheck": "node --input-type=module -e \"await import('./src/index.js'); console.log('ok')\""
   },

@@ -16,8 +16,11 @@ globally if you use it often: `npm i -g @unravel-tech/thing`.
 | --- | --- |
 | `thing --version` / `thing version` | Show the installed CLI version |
 | `thing update [--force] [--manager npm\|bun]` | Install the latest release globally; `--force` runs even when the server reports this version as current |
-| `thing login [--server url] [--no-browser]` | Explicit device-code login; opens browser approval and stores a token |
-| `thing logout` / `thing whoami` | Clear / show the current identity and where pushes land |
+| `thing login [--account name] [--server url] [--no-browser]` | Add or refresh a named account with device-code login; defaults the name to the authenticated email |
+| `thing accounts` | List saved accounts and show which one this directory resolves to |
+| `thing switch <account> [--local]` | Change the global default account, or bind an account to the current Git repository/working directory |
+| `thing switch --clear-local` | Remove the account binding inherited by the current directory |
+| `thing logout [--account name] [--all]` / `thing whoami` | Remove saved credentials / show the resolved identity and where pushes land |
 | `thing default [team] [--clear]` | Show or set your server-side default push target (used when no `--team` is given, from any machine) |
 | `thing use <team> [project]` | Set a local active team/project override for this machine |
 | `thing push <file.html\|.md\|.pdf\|.png\|.jpg\|.gif\|.webp> [--name x] [--team t] [--project p] [--visibility v]` | Authenticate if needed, then push a new immutable version and print the served URL |
@@ -27,7 +30,9 @@ globally if you use it often: `npm i -g @unravel-tech/thing`.
 | `thing open <name>` | Open the artifact in a browser |
 | `thing mcp` | Run a Model Context Protocol server over stdio (tools: `server_info`, `push_artifact`, `list_artifacts`, `whoami`) |
 
-Every command accepts `--json` for machine-readable output.
+Every command accepts `--json` for machine-readable output. Authenticated
+commands also accept `--account name` to use a saved account once without
+changing either the global default or a directory binding.
 An unauthenticated `push --json` emits newline-delimited authentication status;
 the final JSON object is always the push result. Use `--no-login` to fail fast
 instead of starting interactive authentication, such as in CI.
@@ -57,6 +62,42 @@ The corresponding Thing server endpoint and enforcement middleware are
 specified in [`THING_SERVER_UPDATE_POLICY.md`](./THING_SERVER_UPDATE_POLICY.md).
 
 ## Context resolution
+
+### Accounts
+
+Thing can keep multiple logins on one machine. Give accounts short names when
+you add them, list them, and switch the global default:
+
+```sh
+thing login --account work
+thing login --account personal
+thing accounts
+thing switch work
+```
+
+To associate the current repository with an account, run:
+
+```sh
+thing switch work --local
+```
+
+Inside a Git repository, this binds its root and every directory beneath it.
+Outside Git, it binds the current working directory and its descendants. The
+binding is stored in your user config—not `.thing.json`—so personal account
+names and credentials never become repository changes. A local binding wins
+over the global default; `--account personal` wins over both for one command.
+Use `thing switch --clear-local` to remove the binding.
+
+Existing single-login config files migrate automatically to an account named
+`default`. New logins without `--account` use the authenticated email address
+as the account name.
+
+Account selection is resolved in this order: `--account` → the nearest
+repository/directory binding → the global `thing switch` selection → the only
+saved account. `THING_TOKEN` and `THING_SERVER` still override stored
+credentials for CI and MCP configurations.
+
+### Team and project
 
 Which team a push lands in is decided in order: `--team` flag → `.thing.json` in the
 working directory → a local `thing use` override → your **server-side default**
