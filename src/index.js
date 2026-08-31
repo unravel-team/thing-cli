@@ -59,15 +59,93 @@ function writeJson(path, value) {
   writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`);
 }
 
+function isRecord(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function savedAccounts(global) {
+  return isRecord(global.accounts) ? global.accounts : {};
+}
+
+function migrateGlobalConfig(value) {
+  const global = isRecord(value) ? value : {};
+  let migrated = false;
+  if (typeof global.token === "string" && global.token) {
+    const accounts = savedAccounts(global);
+    let name = typeof global.activeAccount === "string" && global.activeAccount.trim()
+      ? global.activeAccount.trim()
+      : "default";
+    if (accounts[name] && accounts[name].token !== global.token) {
+      let suffix = 2;
+      while (accounts[`default-${suffix}`]) suffix += 1;
+      name = `default-${suffix}`;
+    }
+    accounts[name] = {
+      ...(isRecord(accounts[name]) ? accounts[name] : {}),
+      server: stripSlash(global.server || DEFAULT_SERVER),
+      token: global.token
+    };
+    global.accounts = accounts;
+    global.activeAccount = name;
+    delete global.token;
+    migrated = true;
+  }
+  return { global, migrated };
+}
+
 function projectConfigPath(cwd) {
   return join(cwd, ".thing.json");
 }
 
+function normalizedDirectory(cwd) {
+  const path = resolve(cwd);
+  try {
+    return realpathSync(path);
+  } catch {
+    return path;
+  }
+}
+
+function ancestorDirectories(cwd) {
+  const directories = [];
+  let current = normalizedDirectory(cwd);
+  while (true) {
+    directories.push(current);
+    const parent = dirname(current);
+    if (parent === current) return directories;
+    current = parent;
+  }
+}
+
+function repositoryRoot(cwd) {
+  return ancestorDirectories(cwd).find((directory) => existsSync(join(directory, ".git"))) || null;
+}
+
+function directoryAccountBinding(global, cwd) {
+  const bindings = isRecord(global.accountBindings) ? global.accountBindings : {};
+  for (const directory of ancestorDirectories(cwd)) {
+    if (typeof bindings[directory] === "string" && bindings[directory]) {
+      return { account: bindings[directory], directory };
+    }
+  }
+  return null;
+}
+
 function loadState(cwd, env = process.env) {
+  const globalPath = configPath(env);
+  const migrated = migrateGlobalConfig(readJson(globalPath));
+  if (migrated.migrated) {
+    try {
+      writeJson(globalPath, migrated.global);
+    } catch {
+      // A read-only legacy config can still be used for this invocation.
+    }
+  }
   return {
     env,
-    globalPath: configPath(env),
-    global: readJson(configPath(env)),
+    cwd: normalizedDirectory(cwd),
+    globalPath,
+    global: migrated.global,
     projectPath: projectConfigPath(cwd),
     project: readJson(projectConfigPath(cwd))
   };
@@ -116,16 +194,56 @@ function stripSlash(server) {
   return String(server || DEFAULT_SERVER).replace(/\/+$/, "");
 }
 
+function cleanAccountName(value) {
+  if (typeof value !== "string" || !value.trim()) throw new CliError("Account name cannot be empty.");
+  const name = value.trim();
+  if (name.length > 100 || /[\u0000-\u001f\u007f]/.test(name)) throw new CliError("Account name must be 100 characters or fewer and cannot contain control characters.");
+  return name;
+}
+
+function accountSelection(state, flags = {}, options = {}) {
+  const accounts = savedAccounts(state.global);
+  const binding = directoryAccountBinding(state.global, state.cwd);
+  let name = null;
+  let source = null;
+  if (flags.account !== undefined) {
+    name = cleanAccountName(flags.account);
+    source = "flag";
+  } else if (binding) {
+    name = binding.account;
+    source = "directory";
+  } else if (typeof state.global.activeAccount === "string" && state.global.activeAccount) {
+    name = state.global.activeAccount;
+    source = "global";
+  } else {
+    const names = Object.keys(accounts);
+    if (names.length === 1) {
+      [name] = names;
+      source = "only";
+    }
+  }
+
+  const account = name && isRecord(accounts[name]) ? accounts[name] : null;
+  if (name && !account && options.strict !== false) {
+    const location = source === "directory" && binding ? ` for ${binding.directory}` : "";
+    throw new CliError(`Unknown account "${name}"${location}. Run \`thing accounts\` to see saved accounts, then \`thing switch <account>${source === "directory" ? " --local" : ""}\`.`);
+  }
+  return { name, account, source, binding };
+}
+
 function context(state, flags = {}) {
   const env = state.env ?? process.env;
+  const selected = accountSelection(state, flags);
   return {
     // THING_SERVER and THING_TOKEN let an MCP client run this with no prior
     // `thing login`: the whole config is a paste, which is the difference
     // between usable and not for anyone who does not live in a terminal.
-    server: stripSlash(flags.server || env.THING_SERVER || state.project.server || state.global.server || DEFAULT_SERVER),
-    token: flags.token || env.THING_TOKEN || state.global.token || null,
+    server: stripSlash(flags.server || env.THING_SERVER || state.project.server || selected.account?.server || state.global.server || DEFAULT_SERVER),
+    token: flags.token || env.THING_TOKEN || selected.account?.token || null,
     team: flags.team || state.project.team || state.global.activeTeam || null,
-    project: flags.project || state.project.project || state.global.activeProject || null
+    project: flags.project || state.project.project || state.global.activeProject || null,
+    account: selected.name || null,
+    accountSource: selected.source || null
   };
 }
 
@@ -405,8 +523,20 @@ function openBrowser(url) {
   }
 }
 
+function loginServer(state, flags = {}) {
+  const env = state.env ?? process.env;
+  let selectedAccount = null;
+  if (flags.account !== undefined) {
+    const name = cleanAccountName(flags.account);
+    selectedAccount = savedAccounts(state.global)[name] || null;
+  } else {
+    selectedAccount = accountSelection(state, {}, { strict: false }).account;
+  }
+  return stripSlash(flags.server || env.THING_SERVER || state.project.server || selectedAccount?.server || state.global.server || DEFAULT_SERVER);
+}
+
 async function login(parsed, state, io, options = {}) {
-  const server = context(state, parsed.flags).server;
+  const server = loginServer(state, parsed.flags);
   const device = await api({ server }, "/api/v1/auth/device/code", {
     method: "POST",
     body: { intent: options.intent || "login" }
@@ -449,8 +579,19 @@ async function login(parsed, state, io, options = {}) {
   const ctx = { server, token: tokenResult.access_token };
   const whoami = await api(ctx, "/api/v1/whoami");
 
+  const accountName = parsed.flags.account !== undefined
+    ? cleanAccountName(parsed.flags.account)
+    : cleanAccountName(whoami.user?.email || "default");
+  const accounts = savedAccounts(state.global);
+  accounts[accountName] = {
+    server,
+    token: tokenResult.access_token,
+    ...(whoami.user?.email ? { email: whoami.user.email } : {})
+  };
+  state.global.accounts = accounts;
+  state.global.activeAccount = accountName;
   state.global.server = server;
-  state.global.token = tokenResult.access_token;
+  delete state.global.token;
   // Login no longer pins an "active team". With none set the CLI sends no team
   // and the server routes the push to the caller's default (e.g. the Unravel
   // org for Unravel members). Clear any team an older CLI pinned so existing
@@ -462,10 +603,11 @@ async function login(parsed, state, io, options = {}) {
   const defaultTeam = whoami.defaultTeam?.slug || null;
   output(io, parsed.json, {
     ok: true,
+    account: accountName,
     server,
     user: whoami.user,
     defaultTeam
-  }, `Logged in as ${whoami.user.email}${defaultTeam ? ` (pushes default to ${defaultTeam})` : ""}`);
+  }, `Logged in as ${whoami.user.email} (${accountName})${defaultTeam ? `; pushes default to ${defaultTeam}` : ""}`);
 
   return context(state, parsed.flags);
 }
@@ -478,11 +620,106 @@ async function pushContext(parsed, state, io) {
 }
 
 async function logout(parsed, state, io) {
+  const accounts = savedAccounts(state.global);
+  if (parsed.flags.all) {
+    const count = Object.keys(accounts).length;
+    delete state.global.accounts;
+    delete state.global.activeAccount;
+    delete state.global.accountBindings;
+    delete state.global.token;
+    delete state.global.activeTeam;
+    delete state.global.activeProject;
+    saveGlobal(state);
+    output(io, parsed.json, { ok: true, all: true, removed: count }, count ? `Logged out of ${count} account${count === 1 ? "" : "s"}` : "No saved accounts");
+    return;
+  }
+
+  const selected = parsed.flags.account !== undefined
+    ? { name: cleanAccountName(parsed.flags.account) }
+    : accountSelection(state, parsed.flags, { strict: false });
+  const accountName = selected.name;
+  if (!accountName || !accounts[accountName]) throw new CliError("No stored account to log out. Run `thing accounts` to see saved accounts.");
+  delete accounts[accountName];
+  if (Object.keys(accounts).length) state.global.accounts = accounts;
+  else delete state.global.accounts;
+  if (state.global.activeAccount === accountName) {
+    const [nextAccount] = Object.keys(accounts);
+    if (nextAccount) state.global.activeAccount = nextAccount;
+    else delete state.global.activeAccount;
+  }
+  if (isRecord(state.global.accountBindings)) {
+    for (const [directory, name] of Object.entries(state.global.accountBindings)) {
+      if (name === accountName) delete state.global.accountBindings[directory];
+    }
+    if (!Object.keys(state.global.accountBindings).length) delete state.global.accountBindings;
+  }
   delete state.global.token;
   delete state.global.activeTeam;
   delete state.global.activeProject;
   saveGlobal(state);
-  output(io, parsed.json, { ok: true }, "Logged out");
+  output(io, parsed.json, { ok: true, account: accountName }, `Logged out of ${accountName}`);
+}
+
+async function accountsCommand(parsed, state, io) {
+  const accounts = savedAccounts(state.global);
+  const selected = accountSelection(state, parsed.flags, { strict: false });
+  const binding = directoryAccountBinding(state.global, state.cwd);
+  const items = Object.entries(accounts).map(([name, account]) => ({
+    name,
+    email: isRecord(account) ? account.email || null : null,
+    server: isRecord(account) ? stripSlash(account.server || state.global.server || DEFAULT_SERVER) : null,
+    active: state.global.activeAccount === name,
+    selected: selected.name === name
+  }));
+  const payload = {
+    selectedAccount: selected.name || null,
+    activeAccount: state.global.activeAccount || null,
+    directoryBinding: binding ? { account: binding.account, directory: binding.directory } : null,
+    accounts: items
+  };
+  const lines = items.length
+    ? items.map((account) => `${account.selected ? "*" : " "} ${account.name}\t${account.email || ""}\t${account.server || ""}`)
+    : ["No saved accounts. Run `thing login` to add one."];
+  if (binding) lines.push(`Directory: ${binding.directory} → ${binding.account}`);
+  output(io, parsed.json, payload, lines.join("\n"));
+}
+
+async function switchAccount(parsed, state, io) {
+  const accounts = savedAccounts(state.global);
+  if (parsed.flags["clear-local"]) {
+    const binding = directoryAccountBinding(state.global, state.cwd);
+    if (!binding) throw new CliError("This directory does not have an account binding.");
+    delete state.global.accountBindings[binding.directory];
+    if (!Object.keys(state.global.accountBindings).length) delete state.global.accountBindings;
+    saveGlobal(state);
+    const selected = accountSelection(state, {}, { strict: false });
+    output(io, parsed.json, {
+      ok: true,
+      account: selected.name || null,
+      scope: "directory",
+      cleared: binding.directory
+    }, `Cleared the account binding for ${binding.directory}${selected.name ? `; now using ${selected.name}` : ""}`);
+    return;
+  }
+
+  const [rawName] = parsed.positionals;
+  if (!rawName) throw new CliError("Usage: thing switch <account> [--local]\n       thing switch --clear-local");
+  const accountName = cleanAccountName(rawName);
+  if (!isRecord(accounts[accountName])) throw new CliError(`Unknown account "${accountName}". Run \`thing accounts\` to see saved accounts.`);
+
+  if (parsed.flags.local) {
+    const directory = repositoryRoot(state.cwd) || state.cwd;
+    const bindings = isRecord(state.global.accountBindings) ? state.global.accountBindings : {};
+    bindings[directory] = accountName;
+    state.global.accountBindings = bindings;
+    saveGlobal(state);
+    output(io, parsed.json, { ok: true, account: accountName, scope: "directory", directory }, `Using ${accountName} in ${directory}`);
+    return;
+  }
+
+  state.global.activeAccount = accountName;
+  saveGlobal(state);
+  output(io, parsed.json, { ok: true, account: accountName, scope: "global" }, `Default account set to ${accountName}`);
 }
 
 async function whoami(parsed, state, io) {
@@ -496,8 +733,8 @@ async function whoami(parsed, state, io) {
   output(
     io,
     parsed.json,
-    { ...data, server: ctx.server, activeTeam: ctx.team, activeProject: ctx.project },
-    `${data.user.email}\nserver: ${ctx.server}\npushes go to: ${target}${ctx.project ? `\nproject: ${ctx.project}` : ""}`
+    { ...data, account: ctx.account, accountSource: ctx.accountSource, server: ctx.server, activeTeam: ctx.team, activeProject: ctx.project },
+    `${data.user.email}${ctx.account ? `\naccount: ${ctx.account} (${ctx.accountSource})` : ""}\nserver: ${ctx.server}\npushes go to: ${target}${ctx.project ? `\nproject: ${ctx.project}` : ""}`
   );
 }
 
@@ -766,7 +1003,7 @@ async function mcpTool(state, parsed, name, args, runtime = {}) {
   if (name === "whoami") {
     requireToken(ctx);
     const data = await api(ctx, "/api/v1/whoami");
-    return { user: data.user, server: ctx.server, defaultTeam: data.defaultTeam?.slug ?? null };
+    return { user: data.user, account: ctx.account, accountSource: ctx.accountSource, server: ctx.server, defaultTeam: data.defaultTeam?.slug ?? null };
   }
   if (name === "list_artifacts") {
     requireToken(ctx);
@@ -904,8 +1141,11 @@ function usage() {
 Commands:
   version
   update [--force] [--manager npm|bun]
-  login [--server url] [--no-browser]
-  logout
+  login [--account name] [--server url] [--no-browser]
+  accounts
+  switch <account> [--local]
+  switch --clear-local
+  logout [--account name] [--all]
   whoami
   use <team> [project]
   default [team] [--clear]
@@ -918,6 +1158,7 @@ Commands:
 
 Global options:
   --version, -V
+  --account name
   --json
 `;
 }
@@ -932,7 +1173,7 @@ export async function run(argv = process.argv.slice(2), io = { stdout: process.s
       return 0;
     }
 
-    const localCommands = new Set([undefined, "-h", "--help", "-V", "--version", "version", "update", "mcp"]);
+    const localCommands = new Set([undefined, "-h", "--help", "-V", "--version", "version", "update", "login", "logout", "accounts", "switch", "mcp"]);
     const policy = localCommands.has(parsed.command)
       ? null
       : await getUpdatePolicy(state, parsed.flags, { client: "thing-cli" });
@@ -952,6 +1193,12 @@ export async function run(argv = process.argv.slice(2), io = { stdout: process.s
         break;
       case "logout":
         await logout(parsed, state, io);
+        break;
+      case "accounts":
+        await accountsCommand(parsed, state, io);
+        break;
+      case "switch":
+        await switchAccount(parsed, state, io);
         break;
       case "whoami":
         await whoami(parsed, state, io);

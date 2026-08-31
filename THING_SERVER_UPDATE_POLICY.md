@@ -22,9 +22,9 @@ CLI and MCP policies are independent even though both ship in the same npm packa
 Add these fields to `apps/server/src/config.ts` and document them in `apps/server/.env.example`:
 
 ```env
-THING_CLI_LATEST_VERSION=0.6.0
+THING_CLI_LATEST_VERSION=0.7.0
 THING_CLI_MINIMUM_VERSION=0.6.0
-THING_MCP_LATEST_VERSION=0.6.0
+THING_MCP_LATEST_VERSION=0.7.0
 THING_MCP_MINIMUM_VERSION=0.6.0
 ```
 
