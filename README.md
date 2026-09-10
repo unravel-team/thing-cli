@@ -25,10 +25,11 @@ globally if you use it often: `npm i -g @unravel-tech/thing`.
 | `thing use <team> [project]` | Set a local active team/project override for this machine |
 | `thing push <file.html\|.md\|.pdf\|.png\|.jpg\|.gif\|.webp> [--name x] [--team t] [--project p] [--visibility v]` | Authenticate if needed, then push a new immutable version and print the served URL |
 | `thing list` | List artifacts you can see |
+| `thing comments <name>` | Pull comments and replies from a viewable artifact |
 | `thing versions <name>` | Version history for an artifact |
 | `thing rollback <name> <n>` | Point latest back to version n |
 | `thing open <name>` | Open the artifact in a browser |
-| `thing mcp` | Run a Model Context Protocol server over stdio (tools: `server_info`, `push_artifact`, `list_artifacts`, `whoami`) |
+| `thing mcp` | Run a Model Context Protocol server over stdio (tools: `server_info`, `push_artifact`, `list_artifacts`, `list_artifact_comments`, `whoami`) |
 
 Every command accepts `--json` for machine-readable output. Authenticated
 commands also accept `--account name` to use a saved account once without

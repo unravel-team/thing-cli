@@ -778,6 +778,26 @@ async function list(parsed, state, io) {
   output(io, parsed.json, { artifacts }, artifacts.length ? artifacts.map((a) => `${a.teamSlug}/${a.slug}\t${a.visibility}\t${a.title}`).join("\n") : "No artifacts");
 }
 
+async function commentsCommand(parsed, state, io) {
+  const ctx = context(state, parsed.flags);
+  requireToken(ctx);
+  const [name] = parsed.positionals;
+  if (!name) throw new CliError("Usage: thing comments <artifact>");
+  const artifact = await resolveArtifact(ctx, name);
+  const data = await api(ctx, `/api/v1/artifacts/${encodeURIComponent(artifact.id)}/comments`);
+  const comments = data.comments || [];
+  const text = comments.length
+    ? comments.map((comment) => {
+      const status = comment.resolvedAt ? "resolved" : "open";
+      const version = comment.versionNumber == null ? "latest" : `v${comment.versionNumber}`;
+      const author = comment.author?.name || comment.author?.email || "unknown";
+      const reply = comment.parentId ? `reply to ${comment.parentId}` : "thread";
+      return `${status}\t${version}\t${author}\t${reply}\t${comment.body}`;
+    }).join("\n")
+    : "No comments";
+  output(io, parsed.json, { artifact: data.artifact || artifact, comments }, text);
+}
+
 async function resolveArtifact(ctx, name) {
   const slug = slugify(name);
   const data = await api(ctx, "/api/v1/artifacts");
@@ -980,6 +1000,20 @@ const MCP_TOOLS = [
     }
   },
   {
+    name: "list_artifact_comments",
+    description:
+      "Use this to pull review feedback, replies, and resolved state from an artifact the user can view. Returns author, quote or marked region, and the version each comment refers to.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Artifact name, slug, or title" },
+        team: { type: "string", description: "Team slug when the artifact name is ambiguous" },
+        project: { type: "string", description: "Project slug when the artifact name is ambiguous" }
+      },
+      required: ["name"]
+    }
+  },
+  {
     name: "whoami",
     description:
       "Use this to confirm the user is signed in and which team will own a new artifact. Shows the account, the server, and where pushes land when no team is named.",
@@ -1012,6 +1046,13 @@ async function mcpTool(state, parsed, name, args, runtime = {}) {
     if (ctx.team) artifacts = artifacts.filter((a) => a.teamSlug === ctx.team);
     if (ctx.project) artifacts = artifacts.filter((a) => a.projectSlug === ctx.project);
     return { artifacts };
+  }
+  if (name === "list_artifact_comments") {
+    requireToken(ctx);
+    if (typeof args.name !== "string" || !args.name.trim()) throw new CliError("Artifact name is required.");
+    const artifact = await resolveArtifact(ctx, args.name);
+    const data = await api(ctx, `/api/v1/artifacts/${encodeURIComponent(artifact.id)}/comments`);
+    return { artifact: data.artifact || artifact, comments: data.comments || [] };
   }
   if (name === "push_artifact") {
     requireToken(ctx);
@@ -1151,6 +1192,7 @@ Commands:
   default [team] [--clear]
   push <file.html|.md|.pdf|.png|.jpg|.gif|.webp> [--name x] [--team t] [--project p] [--visibility team|public] [--no-login] [--no-browser]
   list
+  comments <name>
   versions <name>
   rollback <name> <version>
   open <name>
@@ -1214,6 +1256,9 @@ export async function run(argv = process.argv.slice(2), io = { stdout: process.s
         break;
       case "list":
         await list(parsed, state, io);
+        break;
+      case "comments":
+        await commentsCommand(parsed, state, io);
         break;
       case "versions":
         await versionsCommand(parsed, state, io);
