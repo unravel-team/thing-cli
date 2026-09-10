@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -59,6 +59,10 @@ globalThis.fetch = async (input, init = {}) => {
     assert(init.headers.Authorization === "Bearer token-1", "whoami should use the issued token");
     return json({ user: { email: "cli@example.com" }, defaultTeam: null });
   }
+  if (url.pathname === "/api/v1/artifacts" && init.method !== "POST") {
+    assert(init.headers.Authorization === "Bearer comments-token", "comments should resolve artifacts with the selected account token");
+    return json({ artifacts: [{ id: "artifact-comments", slug: "weekly-report", title: "Weekly report", teamSlug: "personal", projectSlug: null, visibility: "team" }] });
+  }
   if (url.pathname === "/api/v1/artifacts") {
     assert(init.headers.Authorization === "Bearer token-1", "push should resume with the issued token");
     return json({
@@ -70,6 +74,13 @@ globalThis.fetch = async (input, init = {}) => {
         url: `${url.origin}/personal/${body.slug}`
       },
       version: { number: 1 }
+    });
+  }
+  if (url.pathname === "/api/v1/artifacts/artifact-comments/comments") {
+    assert(init.headers.Authorization === "Bearer comments-token", "comments should use the selected account token");
+    return json({
+      artifact: { id: "artifact-comments", slug: "weekly-report", title: "Weekly report", visibility: "team" },
+      comments: [{ id: "comment-1", parentId: null, resolvedAt: null, body: "Please tighten the summary.", quote: "Summary", region: null, versionId: "version-2", versionNumber: 2, createdAt: "2026-09-10T10:00:00.000Z", author: { id: "user-1", email: "reviewer@example.com", name: "Reviewer" } }]
     });
   }
   return json({ error: `unexpected path ${url.pathname}` }, 404);
@@ -133,6 +144,21 @@ try {
   assert(afterSecondLogin.activeAccount === "work", "the newest named login should become the global default");
   assert(afterSecondLogin.accounts.work.token === "token-1", "the named login should store its credential");
   assert(afterSecondLogin.accounts["cli@example.com"].token === "token-1", "adding an account should not overwrite earlier credentials");
+  afterSecondLogin.accounts.comments = { server: "https://thing.test", token: "comments-token" };
+  writeFileSync(join(home, ".config", "thing", "config.json"), JSON.stringify(afterSecondLogin));
+
+  let commentsStdout = "";
+  let commentsStderr = "";
+  const commentsCode = await run(["comments", "weekly-report", "--account", "comments", "--server", "https://thing.test", "--json"], {
+    cwd,
+    env: { ...process.env, XDG_CONFIG_HOME: join(home, ".config") },
+    stdout: { write: (chunk) => { commentsStdout += String(chunk); } },
+    stderr: { write: (chunk) => { commentsStderr += String(chunk); } }
+  });
+  assert(commentsCode === 0, `comments command failed: ${commentsStderr || commentsStdout}`);
+  const comments = JSON.parse(commentsStdout);
+  assert(comments.artifact.slug === "weekly-report", "comments JSON should include the resolved artifact");
+  assert(comments.comments[0].versionNumber === 2, "comments JSON should preserve version context");
 } finally {
   globalThis.fetch = originalFetch;
 }

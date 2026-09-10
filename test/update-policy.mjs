@@ -207,6 +207,29 @@ async function testMcpRequired() {
   assert(serverInfo.update.status === "update_required", "server_info must remain available while blocked");
 }
 
+async function testMcpCommentTool() {
+  const home = await mkdtemp(join(tmpdir(), "thing-mcp-comments-"));
+  const env = { ...process.env, XDG_CONFIG_HOME: home, THING_TOKEN: "token" };
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/api/v1/client-policy") return json({ client: "thing-mcp", status: "current" });
+    if (url.pathname === "/api/v1/artifacts") return json({ artifacts: [{ id: "artifact-1", slug: "weekly-report", title: "Weekly report" }] });
+    if (url.pathname === "/api/v1/artifacts/artifact-1/comments") return json({ artifact: { id: "artifact-1", slug: "weekly-report" }, comments: [{ id: "comment-1", body: "Review this", versionNumber: 1, author: { email: "reviewer@example.com" } }] });
+    return json({ error: "unexpected request" }, 404);
+  };
+  const stdin = stdinFor([
+    { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "test", version: "1" } } },
+    { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} },
+    { jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "list_artifact_comments", arguments: { name: "weekly-report" } } }
+  ]);
+  const result = capture({ env, stdin });
+  assert(await run(["mcp"], result.io) === 0, "MCP comments session should complete");
+  const messages = result.stdout().trim().split("\n").map((line) => JSON.parse(line));
+  assert(messages[1].result.tools.some((tool) => tool.name === "list_artifact_comments"), "MCP should advertise the comments tool");
+  const payload = JSON.parse(messages[2].result.content[0].text);
+  assert(payload.artifact.slug === "weekly-report" && payload.comments[0].body === "Review this", "MCP should return pulled comments");
+}
+
 async function testForcedUpdate() {
   let invocation = null;
   const result = capture({
@@ -230,6 +253,7 @@ try {
   await testServerEnforced426();
   await testMcpAdvisory();
   await testMcpRequired();
+  await testMcpCommentTool();
   await testForcedUpdate();
 } finally {
   globalThis.fetch = originalFetch;
