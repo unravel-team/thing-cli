@@ -65,12 +65,14 @@ globalThis.fetch = async (input, init = {}) => {
   }
   if (url.pathname === "/api/v1/artifacts") {
     assert(init.headers.Authorization === "Bearer token-1", "push should resume with the issued token");
+    assert(body.password === "open-sesame", "push should forward --password to the server");
     return json({
       artifact: {
         id: "artifact-1",
         slug: body.slug,
         teamSlug: "personal",
         visibility: body.visibility,
+        hasPassword: Boolean(body.password),
         url: `${url.origin}/personal/${body.slug}`
       },
       version: { number: 1 }
@@ -103,6 +105,8 @@ try {
     "auto-login",
     "--visibility",
     "public",
+    "--password",
+    "open-sesame",
     "--server",
     "https://thing.test",
     "--no-browser",
@@ -118,6 +122,7 @@ try {
   const lines = pushStdout.trim().split("\n").map((line) => JSON.parse(line));
   assert(lines[0].userCode === "ABCD-EFGH", "push should emit device login status first");
   assert(lines.at(-1).url === "https://thing.test/personal/auto-login", "push should resume and emit the artifact URL");
+  assert(lines.at(-1).hasPassword === true, "push should report that a password is set");
   assert(deviceIntent === "push", "automatic authentication should identify push intent");
   const config = JSON.parse(readFileSync(join(home, ".config", "thing", "config.json"), "utf8"));
   assert(config.activeAccount === "cli@example.com", "automatic login should select an account named after the authenticated email");

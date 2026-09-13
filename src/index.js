@@ -831,7 +831,10 @@ function docFromFile(path) {
     : { filename: basename(path), contentBase64: readFileSync(path).toString("base64") };
 }
 
-async function pushToServer(ctx, { doc, name, visibility }) {
+// `password` is a second door beside team and people access: anyone who knows
+// it can open the artifact. Sent only when given, so re-pushing without it
+// keeps whatever is set.
+async function pushToServer(ctx, { doc, name, visibility, password }) {
   requireToken(ctx);
   if (visibility && !VISIBILITIES.has(visibility)) throw new CliError("Invalid visibility. Use team or public.");
   const pushed = await api(ctx, "/api/v1/artifacts", {
@@ -842,6 +845,7 @@ async function pushToServer(ctx, { doc, name, visibility }) {
       slug: slugify(name),
       title: name,
       visibility: visibility || undefined,
+      password: password || undefined,
       ...doc
     }
   });
@@ -850,13 +854,14 @@ async function pushToServer(ctx, { doc, name, visibility }) {
     version: pushed.version,
     url: pushed.artifact.url,
     visibility: pushed.artifact.visibility,
+    hasPassword: Boolean(pushed.artifact.hasPassword),
     tokenedUrl: null
   };
 }
 
 async function push(parsed, state, io) {
   const [file] = parsed.positionals;
-  if (!file) throw new CliError("Usage: thing push <file.html|.md|.pdf|.png|.jpg|.gif|.webp> [--name x] [--team t] [--project p] [--visibility team|public]");
+  if (!file) throw new CliError("Usage: thing push <file.html|.md|.pdf|.png|.jpg|.gif|.webp> [--name x] [--team t] [--project p] [--visibility team|public] [--password p]");
   const path = resolve(file);
   const doc = docFromFile(path);
   if (parsed.flags.visibility && !VISIBILITIES.has(parsed.flags.visibility)) throw new CliError("Invalid visibility. Use team or public.");
@@ -864,7 +869,8 @@ async function push(parsed, state, io) {
   const result = await pushToServer(ctx, {
     doc,
     name: parsed.flags.name || titleFromFile(path),
-    visibility: parsed.flags.visibility
+    visibility: parsed.flags.visibility,
+    password: parsed.flags.password
   });
   output(io, parsed.json, result, result.url);
 }
@@ -983,7 +989,8 @@ const MCP_TOOLS = [
         name: { type: "string", description: "Artifact name (defaults to the filename)" },
         team: { type: "string", description: "Team slug to push to (defaults to the user's default team)" },
         project: { type: "string", description: "Project slug" },
-        visibility: { type: "string", enum: ["team", "public"], description: "Who can see it" }
+        visibility: { type: "string", enum: ["team", "public"], description: "Who can see it" },
+        password: { type: "string", description: "Set a password; anyone who knows it can open the artifact beside team and people access" }
       }
     }
   },
@@ -1071,7 +1078,7 @@ async function mcpTool(state, parsed, name, args, runtime = {}) {
     } else {
       throw new CliError("Provide either `path`, or `content` plus `filename`.");
     }
-    return pushToServer(ctx, { doc, name: args.name || fallbackName, visibility: args.visibility });
+    return pushToServer(ctx, { doc, name: args.name || fallbackName, visibility: args.visibility, password: args.password });
   }
   throw new CliError(`Unknown tool: ${name}`);
 }
@@ -1190,7 +1197,7 @@ Commands:
   whoami
   use <team> [project]
   default [team] [--clear]
-  push <file.html|.md|.pdf|.png|.jpg|.gif|.webp> [--name x] [--team t] [--project p] [--visibility team|public] [--no-login] [--no-browser]
+  push <file.html|.md|.pdf|.png|.jpg|.gif|.webp> [--name x] [--team t] [--project p] [--visibility team|public] [--password p] [--no-login] [--no-browser]
   list
   comments <name>
   versions <name>
