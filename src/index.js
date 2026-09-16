@@ -25,7 +25,7 @@ const UPDATE_STATUSES = new Set(["current", "update_available", "update_required
 // the analytics client header both kept reporting 0.3.0 releases later.
 const VERSION = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
 let clientName = `thing-cli/${VERSION}`;
-const VISIBILITIES = new Set(["team", "public"]);
+const VISIBILITIES = new Set(["private", "team", "public"]);
 
 class CliError extends Error {
   constructor(message, exitCode = 1) {
@@ -836,7 +836,7 @@ function docFromFile(path) {
 // keeps whatever is set.
 async function pushToServer(ctx, { doc, name, visibility, password }) {
   requireToken(ctx);
-  if (visibility && !VISIBILITIES.has(visibility)) throw new CliError("Invalid visibility. Use team or public.");
+  if (visibility && !VISIBILITIES.has(visibility)) throw new CliError("Invalid visibility. Use private, team or public.");
   const pushed = await api(ctx, "/api/v1/artifacts", {
     method: "POST",
     body: {
@@ -861,10 +861,10 @@ async function pushToServer(ctx, { doc, name, visibility, password }) {
 
 async function push(parsed, state, io) {
   const [file] = parsed.positionals;
-  if (!file) throw new CliError("Usage: thing push <file.html|.md|.pdf|.png|.jpg|.gif|.webp> [--name x] [--team t] [--project p] [--visibility team|public] [--password p]");
+  if (!file) throw new CliError("Usage: thing push <file.html|.md|.pdf|.png|.jpg|.gif|.webp> [--name x] [--team t] [--project p] [--visibility private|team|public] [--password p]");
   const path = resolve(file);
   const doc = docFromFile(path);
-  if (parsed.flags.visibility && !VISIBILITIES.has(parsed.flags.visibility)) throw new CliError("Invalid visibility. Use team or public.");
+  if (parsed.flags.visibility && !VISIBILITIES.has(parsed.flags.visibility)) throw new CliError("Invalid visibility. Use private, team or public.");
   const ctx = await pushContext(parsed, state, io);
   const result = await pushToServer(ctx, {
     doc,
@@ -989,7 +989,7 @@ const MCP_TOOLS = [
         name: { type: "string", description: "Artifact name (defaults to the filename)" },
         team: { type: "string", description: "Team slug to push to (defaults to the user's default team)" },
         project: { type: "string", description: "Project slug" },
-        visibility: { type: "string", enum: ["team", "public"], description: "Who can see it" },
+        visibility: { type: "string", enum: ["private", "team", "public"], description: "Who can see it: private is only you and people you add, team is everyone in the org, public is anyone with the link" },
         password: { type: "string", description: "Set a password; anyone who knows it can open the artifact beside team and people access" }
       }
     }
@@ -1197,7 +1197,7 @@ Commands:
   whoami
   use <team> [project]
   default [team] [--clear]
-  push <file.html|.md|.pdf|.png|.jpg|.gif|.webp> [--name x] [--team t] [--project p] [--visibility team|public] [--password p] [--no-login] [--no-browser]
+  push <file.html|.md|.pdf|.png|.jpg|.gif|.webp> [--name x] [--team t] [--project p] [--visibility private|team|public] [--password p] [--no-login] [--no-browser]
   list
   comments <name>
   versions <name>
