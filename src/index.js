@@ -10,6 +10,7 @@ import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from
 import { basename, dirname, extname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { spawn, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { pathToFileURL } from "node:url";
 
 const DEFAULT_SERVER = process.env.THING_SERVER || "https://usething.ai";
@@ -473,31 +474,50 @@ async function api(ctx, path, options = {}) {
     signal: options.signal
   });
   const text = await response.text();
-  let data = null;
-  if (text) {
-    try {
-      data = JSON.parse(text);
-    } catch {
-      data = { text };
-    }
-  }
-  if (!response.ok) {
-    if (response.status === 426 && data?.code === "CLIENT_UPDATE_REQUIRED") {
-      throw new UpdateRequiredError(normalizeUpdatePolicy(data, clientKind()) || {
-        status: "update_required",
-        client: clientKind(),
-        currentVersion: VERSION,
-        latestVersion: safeVersion(data.latestVersion),
-        minimumVersion: safeVersion(data.minimumVersion),
-        package: PACKAGE_NAME
-      });
-    }
-    const message = data?.error || data?.text || `${response.status} ${response.statusText}`;
-    const error = new CliError(message, response.status === 401 ? 2 : 1);
-    error.response = data;
-    throw error;
-  }
+  const data = parseBody(text);
+  if (!response.ok) throw responseError(response, data);
   return data ?? {};
+}
+
+function parseBody(text) {
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { text };
+  }
+}
+
+function responseError(response, data) {
+  if (response.status === 426 && data?.code === "CLIENT_UPDATE_REQUIRED") {
+    return new UpdateRequiredError(normalizeUpdatePolicy(data, clientKind()) || {
+      status: "update_required",
+      client: clientKind(),
+      currentVersion: VERSION,
+      latestVersion: safeVersion(data.latestVersion),
+      minimumVersion: safeVersion(data.minimumVersion),
+      package: PACKAGE_NAME
+    });
+  }
+  const message = data?.error || data?.text || `${response.status} ${response.statusText}`;
+  const error = new CliError(message, response.status === 401 ? 2 : 1);
+  error.status = response.status;
+  error.response = data;
+  return error;
+}
+
+// Like api(), but for endpoints that answer with raw bytes rather than JSON.
+// Errors still arrive as JSON, so they share api()'s handling.
+async function download(ctx, path) {
+  const response = await fetch(`${ctx.server}${path}`, {
+    headers: {
+      Accept: "*/*",
+      "X-Thing-Client": clientName,
+      ...(ctx.token ? { Authorization: `Bearer ${ctx.token}` } : {})
+    }
+  });
+  if (!response.ok) throw responseError(response, parseBody(await response.text()));
+  return { bytes: Buffer.from(await response.arrayBuffer()), headers: response.headers };
 }
 
 async function sleep(ms) {
@@ -913,6 +933,124 @@ async function openCommand(parsed, state, io) {
   output(io, parsed.json, { url, artifact }, url);
 }
 
+// --- Pulling (view-scoped) --------------------------------------------------
+// Readers hold an artifact by the URL they were given, often with a ?k= link
+// key and no team membership, so pull is addressed by that URL (or team/slug)
+// and goes through the server's view-scoped /artifacts/by-path routes rather
+// than the editor-scoped list. A bare name still works for your own artifacts.
+
+function parseVersionNumber(value) {
+  const version = Number(value);
+  if (!Number.isInteger(version) || version <= 0) throw new CliError("Version must be a positive integer.");
+  return version;
+}
+
+async function artifactRef(ctx, input) {
+  const ref = String(input || "").trim();
+  if (!ref) throw new CliError("Artifact reference is required.");
+  if (/^https?:\/\//i.test(ref)) {
+    let url;
+    try {
+      url = new URL(ref);
+    } catch {
+      throw new CliError(`Invalid URL: ${ref}`);
+    }
+    const parts = url.pathname.split("/").filter(Boolean).map(decodeURIComponent);
+    if (parts.length !== 2 && !(parts.length === 4 && parts[2] === "v")) {
+      throw new CliError(`Not an artifact URL: ${ref}. Expected ${url.origin}/<team>/<artifact>.`);
+    }
+    // The token belongs to the selected account's server; never hand it to a
+    // different host just because a pasted URL points there.
+    const sameServer = url.origin === new URL(ctx.server).origin;
+    return {
+      server: url.origin,
+      token: sameServer ? ctx.token : null,
+      team: parts[0],
+      slug: parts[1],
+      version: parts.length === 4 ? parseVersionNumber(parts[3]) : null,
+      key: url.searchParams.get("k")
+    };
+  }
+  const parts = ref.split("/").filter(Boolean);
+  if (parts.length === 2) return { server: ctx.server, token: ctx.token, team: parts[0], slug: parts[1], version: null, key: null };
+  if (parts.length !== 1) throw new CliError(`Invalid artifact reference: ${ref}. Use a URL, <team>/<artifact>, or a name.`);
+  if (ctx.team) return { server: ctx.server, token: ctx.token, team: ctx.team, slug: slugify(ref), version: null, key: null };
+  if (!ctx.token) throw new CliError(`Can't resolve "${ref}" without signing in. Pass the artifact URL or <team>/<artifact>, or run \`thing login\`.`);
+  const artifact = await resolveArtifact(ctx, ref);
+  return { server: ctx.server, token: ctx.token, team: artifact.teamSlug, slug: artifact.slug, version: null, key: null };
+}
+
+function attachmentFilename(headers) {
+  const match = /filename="([^"]+)"/i.exec(headers.get("content-disposition") || "");
+  // basename() so a hostile header can never write outside the target directory.
+  const name = match ? basename(match[1]).replace(/[^A-Za-z0-9._-]/g, "-") : "";
+  return name && name !== "." && name !== ".." ? name : null;
+}
+
+async function fetchArtifact(ctx, input, versionOverride) {
+  const ref = await artifactRef(ctx, input);
+  const version = versionOverride == null ? ref.version : parseVersionNumber(versionOverride);
+  const base = `/api/v1/artifacts/by-path/${encodeURIComponent(ref.team)}/${encodeURIComponent(ref.slug)}`;
+  const path = `${base}${version == null ? "" : `/v/${version}`}/download${ref.key ? `?k=${encodeURIComponent(ref.key)}` : ""}`;
+  let result;
+  try {
+    result = await download({ server: ref.server, token: ref.token }, path);
+  } catch (error) {
+    // The server answers 404 for both "missing" and "not yours", by design.
+    if (error.status === 404) {
+      const label = `${ref.team}/${ref.slug}${version == null ? "" : ` v${version}`}`;
+      const hint = ref.token ? "" : " If it isn't public, run `thing login` or pass the full share link.";
+      throw new CliError(`Artifact not found or not shared with you: ${label}.${hint}`);
+    }
+    throw error;
+  }
+  const { bytes, headers } = result;
+  const contentHash = headers.get("x-thing-content-hash");
+  const actualHash = createHash("sha256").update(bytes).digest("hex");
+  if (contentHash && contentHash !== actualHash) {
+    throw new CliError(`Download of ${ref.team}/${ref.slug} failed verification: expected sha256 ${contentHash}, got ${actualHash}.`);
+  }
+  const versionNumber = Number(headers.get("x-thing-version")) || version;
+  return {
+    team: ref.team,
+    slug: ref.slug,
+    version: versionNumber,
+    contentType: (headers.get("content-type") || "application/octet-stream").split(";")[0].trim(),
+    contentHash: actualHash,
+    size: bytes.byteLength,
+    filename: attachmentFilename(headers) || `${ref.slug}${versionNumber ? `-v${versionNumber}` : ""}`,
+    url: `${ref.server}/${ref.team}/${ref.slug}${version == null ? "" : `/v/${version}`}`,
+    bytes
+  };
+}
+
+function isTextType(contentType) {
+  return contentType.startsWith("text/") || contentType === "application/json" || contentType.endsWith("+xml");
+}
+
+function writeArtifactFile(path, bytes, force) {
+  if (existsSync(path) && !force) throw new CliError(`${path} already exists. Pass --force to overwrite it.`);
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, bytes);
+}
+
+async function pull(parsed, state, io) {
+  const [ref, versionText] = parsed.positionals;
+  if (!ref) throw new CliError("Usage: thing pull <url|team/artifact|name> [version] [--output path|-] [--force]");
+  const ctx = context(state, parsed.flags);
+  const { bytes, ...meta } = await fetchArtifact(ctx, ref, versionText);
+  const target = parsed.flags.output;
+  if (target === "-") {
+    if (parsed.json) throw new CliError("--output - writes raw bytes to stdout and can't be combined with --json.");
+    io.stdout.write(bytes);
+    return;
+  }
+  if (target === true) throw new CliError("--output needs a path, or - for stdout.");
+  const path = resolve(io.cwd || process.cwd(), target || meta.filename);
+  writeArtifactFile(path, bytes, Boolean(parsed.flags.force));
+  output(io, parsed.json, { ...meta, path }, path);
+}
+
 function versionCommand(parsed, io, name = "thing-cli") {
   output(io, parsed.json, { name, version: VERSION }, `${name === "thing-mcp" ? "thing-mcp" : "thing"} ${VERSION}`);
 }
@@ -965,9 +1103,9 @@ async function updateCommandHandler(parsed, state, io) {
 
 // --- MCP server (`thing mcp`) ---------------------------------------------
 // Newline-delimited JSON-RPC 2.0 over stdio, per the Model Context Protocol.
-// Zero dependencies: four tools that reuse the CLI's own auth and push path,
-// so any MCP client (Claude Code, Cursor, a desktop assistant) can publish
-// artifacts through the user's existing `thing login`.
+// Zero dependencies: tools that reuse the CLI's own auth, push and pull paths,
+// so any MCP client (Claude Code, Cursor, a desktop assistant) can publish and
+// read artifacts through the user's existing `thing login`.
 
 const MCP_TOOLS = [
   {
@@ -1004,6 +1142,21 @@ const MCP_TOOLS = [
         team: { type: "string", description: "Only artifacts in this team slug" },
         project: { type: "string", description: "Only artifacts in this project" }
       }
+    }
+  },
+  {
+    name: "fetch_artifact",
+    description:
+      "Use this when the user gives you a thing link, or names a published artifact, and wants you to read it, use it as context, or edit it. Returns the exact source that was pushed (HTML or Markdown, not the rendered page) inline. Works for anything the user can open in a browser, including artifacts shared with them that they cannot edit. Pass `path` to save to a file instead; PDFs and images must be saved via `path`.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        artifact: { type: "string", description: "Artifact URL as shared (keep any ?k= key), <team>/<artifact>, or the name of one of the user's own artifacts" },
+        version: { type: "integer", minimum: 1, description: "Pin a version number (defaults to latest, or the version in the URL)" },
+        path: { type: "string", description: "Save the bytes to this file instead of returning them inline" },
+        team: { type: "string", description: "Team slug when passing a bare name" }
+      },
+      required: ["artifact"]
     }
   },
   {
@@ -1060,6 +1213,19 @@ async function mcpTool(state, parsed, name, args, runtime = {}) {
     const artifact = await resolveArtifact(ctx, args.name);
     const data = await api(ctx, `/api/v1/artifacts/${encodeURIComponent(artifact.id)}/comments`);
     return { artifact: data.artifact || artifact, comments: data.comments || [] };
+  }
+  if (name === "fetch_artifact") {
+    const { bytes, ...meta } = await fetchArtifact(ctx, args.artifact, args.version);
+    if (args.path) {
+      // Agents re-fetch to pick up new versions, so overwriting is expected here.
+      const path = resolve(String(args.path));
+      writeArtifactFile(path, bytes, true);
+      return { ...meta, path };
+    }
+    if (!isTextType(meta.contentType)) {
+      throw new CliError(`${meta.team}/${meta.slug} is ${meta.contentType}; pass \`path\` to save it to a file.`);
+    }
+    return { ...meta, content: bytes.toString("utf8") };
   }
   if (name === "push_artifact") {
     requireToken(ctx);
@@ -1121,8 +1287,11 @@ async function mcp(parsed, state, io) {
         if (name !== "server_info" && updatePolicy?.status === "update_required") {
           throw new UpdateRequiredError(updatePolicy);
         }
-        const result = await mcpTool(state, parsed, name, args, { updatePolicy });
+        const { content: document, ...result } = await mcpTool(state, parsed, name, args, { updatePolicy });
         const content = [{ type: "text", text: JSON.stringify(result, null, 2) }];
+        // A fetched document rides as its own block so the model reads the
+        // source as-is instead of a JSON-escaped string.
+        if (typeof document === "string") content.push({ type: "text", text: document });
         if (name !== "server_info" && updatePolicy?.status === "update_available" && !advisoryDelivered) {
           content.push({ type: "text", text: updateNotice(updatePolicy, "thing-mcp") });
           advisoryDelivered = true;
@@ -1203,6 +1372,7 @@ Commands:
   versions <name>
   rollback <name> <version>
   open <name>
+  pull <url|team/artifact|name> [version] [--output path|-] [--force]
   mcp [--version]         # Model Context Protocol server over stdio
 
 Global options:
@@ -1275,6 +1445,9 @@ export async function run(argv = process.argv.slice(2), io = { stdout: process.s
         break;
       case "open":
         await openCommand(parsed, state, io);
+        break;
+      case "pull":
+        await pull(parsed, state, io);
         break;
       case "mcp":
         await mcp(parsed, state, io);
