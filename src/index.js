@@ -768,14 +768,34 @@ async function defaultTeam(parsed, state, io) {
   output(io, parsed.json, data, slug ? `Default push target set to ${slug}` : "Default push target cleared");
 }
 
-async function list(parsed, state, io) {
-  const ctx = context(state, parsed.flags);
-  requireToken(ctx);
-  const data = await api(ctx, "/api/v1/artifacts");
+// Server-side filters, sorting and paging (thing server API, Oct 2026). Team
+// and project are still filtered here too, for servers that predate them.
+function listPath(ctx, opts) {
+  const query = new URLSearchParams();
+  if (ctx.team) query.set("team", ctx.team);
+  for (const [param, value] of [["label", opts.label], ["q", opts.search], ["sort", opts.sort], ["order", opts.order], ["limit", opts.limit], ["offset", opts.offset]]) {
+    if (value != null && value !== true && value !== "") query.set(param, String(value));
+  }
+  const qs = query.toString();
+  return `/api/v1/artifacts${qs ? `?${qs}` : ""}`;
+}
+
+async function listArtifacts(ctx, opts) {
+  const data = await api(ctx, listPath(ctx, opts));
   let artifacts = data.artifacts || [];
   if (ctx.team) artifacts = artifacts.filter((artifact) => artifact.teamSlug === ctx.team);
   if (ctx.project) artifacts = artifacts.filter((artifact) => artifact.projectSlug === ctx.project);
-  output(io, parsed.json, { artifacts }, artifacts.length ? artifacts.map((a) => `${a.teamSlug}/${a.slug}\t${a.visibility}\t${a.title}`).join("\n") : "No artifacts");
+  return { artifacts, nextOffset: data.nextOffset ?? null };
+}
+
+async function list(parsed, state, io) {
+  const ctx = context(state, parsed.flags);
+  requireToken(ctx);
+  const data = await listArtifacts(ctx, parsed.flags);
+  const { artifacts } = data;
+  const rows = artifacts.map((a) => `${a.teamSlug}/${a.slug}\t${a.visibility}\t${a.title}${a.labels?.length ? `\t[${a.labels.join(", ")}]` : ""}`);
+  if (data.nextOffset != null) rows.push(`More: --offset ${data.nextOffset}`);
+  output(io, parsed.json, data, artifacts.length ? rows.join("\n") : "No artifacts");
 }
 
 async function commentsCommand(parsed, state, io) {
@@ -997,12 +1017,18 @@ const MCP_TOOLS = [
   {
     name: "list_artifacts",
     description:
-      "Use this to find a link the user published earlier, or to check whether something is already published before pushing it again. Lists artifacts the signed-in user can see, with team, visibility and title.",
+      "Use this to find a link the user published earlier, or to check whether something is already published before pushing it again. Lists artifacts the signed-in user can see, with team, visibility, title and labels. Filter by label or search, sort by created or updated time, and page with limit and offset.",
     inputSchema: {
       type: "object",
       properties: {
         team: { type: "string", description: "Only artifacts in this team slug" },
-        project: { type: "string", description: "Only artifacts in this project" }
+        project: { type: "string", description: "Only artifacts in this project" },
+        label: { type: "string", description: "Only artifacts carrying this label" },
+        search: { type: "string", description: "Only artifacts whose title or slug contains this text" },
+        sort: { type: "string", enum: ["updated", "created"], description: "Sort by last update (default) or creation time" },
+        order: { type: "string", enum: ["desc", "asc"], description: "Newest first (default) or oldest first" },
+        limit: { type: "integer", minimum: 1, maximum: 100, description: "Page size; omit to list everything" },
+        offset: { type: "integer", minimum: 0, description: "Skip this many; pass the previous nextOffset to get the next page" }
       }
     }
   },
@@ -1048,11 +1074,7 @@ async function mcpTool(state, parsed, name, args, runtime = {}) {
   }
   if (name === "list_artifacts") {
     requireToken(ctx);
-    const data = await api(ctx, "/api/v1/artifacts");
-    let artifacts = data.artifacts || [];
-    if (ctx.team) artifacts = artifacts.filter((a) => a.teamSlug === ctx.team);
-    if (ctx.project) artifacts = artifacts.filter((a) => a.projectSlug === ctx.project);
-    return { artifacts };
+    return listArtifacts(ctx, args);
   }
   if (name === "list_artifact_comments") {
     requireToken(ctx);
@@ -1198,7 +1220,7 @@ Commands:
   use <team> [project]
   default [team] [--clear]
   push <file.html|.md|.pdf|.png|.jpg|.gif|.webp> [--name x] [--team t] [--project p] [--visibility private|team|public] [--password p] [--no-login] [--no-browser]
-  list
+  list [--team t] [--label l] [--search text] [--sort updated|created] [--order desc|asc] [--limit n] [--offset n]
   comments <name>
   versions <name>
   rollback <name> <version>
