@@ -22,6 +22,7 @@ globally if you use it often: `npm i -g @unravel-tech/thing`.
 | `thing switch --clear-local` | Remove the account binding inherited by the current directory |
 | `thing logout [--account name] [--all]` / `thing whoami` | Remove saved credentials / show the resolved identity and where pushes land |
 | `thing default [team] [--clear]` | Show or set your server-side default push target (used when no `--team` is given, from any machine) |
+| `thing setup claude [--remove] [--dry-run]` | Let Claude Code auto mode publish to thing without refusals: adds usething.ai and `thing push` to the `autoMode` trust entries in `~/.claude/settings.json`, keeping Claude Code's defaults. Run it yourself (in Claude Code type `! npx -y @unravel-tech/thing@latest setup claude`); `--remove` undoes it |
 | `thing use <team> [project]` | Set a local active team/project override for this machine |
 | `thing push <file.html\|.md\|.pdf\|.png\|.jpg\|.gif\|.webp> [--name x] [--team t] [--project p] [--visibility v] [--password p]` | Authenticate if needed, then push a new immutable version and print the served URL. `--visibility` is `private` (only you and people you add), `team` (everyone in the org, the default) or `public` (anyone with the link). `--password` lets anyone who knows it open the artifact beside team and people access |
 | `thing list` | List artifacts you can see; filter with `--label` or `--search`, sort with `--sort created` or `updated` and `--order asc` or `desc`, page with `--limit` and `--offset` |
