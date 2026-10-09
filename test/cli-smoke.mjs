@@ -33,6 +33,7 @@ const file = join(cwd, "report.html");
 writeFileSync(file, "<!doctype html><h1>automatic login push</h1>");
 
 let deviceIntent = null;
+let listQuery = null;
 globalThis.fetch = async (input, init = {}) => {
   const url = new URL(String(input));
   const body = init.body ? JSON.parse(String(init.body)) : null;
@@ -58,6 +59,10 @@ globalThis.fetch = async (input, init = {}) => {
   if (url.pathname === "/api/v1/whoami") {
     assert(init.headers.Authorization === "Bearer token-1", "whoami should use the issued token");
     return json({ user: { email: "cli@example.com" }, defaultTeam: null });
+  }
+  if (url.pathname === "/api/v1/artifacts" && url.searchParams.has("label")) {
+    listQuery = Object.fromEntries(url.searchParams);
+    return json({ artifacts: [{ id: "a1", slug: "q4-pricing", title: "Q4 pricing", teamSlug: "acme", projectSlug: null, visibility: "team", labels: ["pricing"] }], nextOffset: 10 });
   }
   if (url.pathname === "/api/v1/artifacts" && init.method !== "POST") {
     assert(init.headers.Authorization === "Bearer comments-token", "comments should resolve artifacts with the selected account token");
@@ -164,6 +169,19 @@ try {
   const comments = JSON.parse(commentsStdout);
   assert(comments.artifact.slug === "weekly-report", "comments JSON should include the resolved artifact");
   assert(comments.comments[0].versionNumber === 2, "comments JSON should preserve version context");
+
+  let listStdout = "";
+  let listStderr = "";
+  const listCode = await run(["list", "--account", "comments", "--server", "https://thing.test", "--team", "acme", "--label", "pricing", "--search", "q4", "--sort", "created", "--order", "asc", "--limit", "10"], {
+    cwd,
+    env: { ...process.env, XDG_CONFIG_HOME: join(home, ".config") },
+    stdout: { write: (chunk) => { listStdout += String(chunk); } },
+    stderr: { write: (chunk) => { listStderr += String(chunk); } }
+  });
+  assert(listCode === 0, `list command failed: ${listStderr || listStdout}`);
+  assert(JSON.stringify(listQuery) === JSON.stringify({ team: "acme", label: "pricing", q: "q4", sort: "created", order: "asc", limit: "10" }), `list should send filters to the server: ${JSON.stringify(listQuery)}`);
+  assert(listStdout.includes("acme/q4-pricing\tteam\tQ4 pricing\t[pricing]"), `list should show labels: ${listStdout}`);
+  assert(listStdout.includes("More: --offset 10"), "list should point to the next page");
 } finally {
   globalThis.fetch = originalFetch;
 }

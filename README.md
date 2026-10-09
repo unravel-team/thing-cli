@@ -24,7 +24,7 @@ globally if you use it often: `npm i -g @unravel-tech/thing`.
 | `thing default [team] [--clear]` | Show or set your server-side default push target (used when no `--team` is given, from any machine) |
 | `thing use <team> [project]` | Set a local active team/project override for this machine |
 | `thing push <file.html\|.md\|.pdf\|.png\|.jpg\|.gif\|.webp> [--name x] [--team t] [--project p] [--visibility v] [--password p]` | Authenticate if needed, then push a new immutable version and print the served URL. `--visibility` is `private` (only you and people you add), `team` (everyone in the org, the default) or `public` (anyone with the link). `--password` lets anyone who knows it open the artifact beside team and people access |
-| `thing list` | List artifacts you can see |
+| `thing list` | List artifacts you can see; filter with `--label` or `--search`, sort with `--sort created` or `updated` and `--order asc` or `desc`, page with `--limit` and `--offset` |
 | `thing comments <name>` | Pull comments and replies from a viewable artifact |
 | `thing versions <name>` | Version history for an artifact |
 | `thing rollback <name> <n>` | Point latest back to version n |
