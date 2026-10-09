@@ -37,7 +37,7 @@
     "cursor"
   ],
   "scripts": {
-    "test": "node test/cli-smoke.mjs && node test/accounts.mjs && node test/update-policy.mjs",
+    "test": "node test/cli-smoke.mjs && node test/accounts.mjs && node test/update-policy.mjs && node test/pull.mjs",
     "smoke": "node test/cli-smoke.mjs",
     "typecheck": "node --input-type=module -e \"await import('./src/index.js'); console.log('ok')\""
   },

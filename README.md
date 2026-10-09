@@ -29,7 +29,8 @@ globally if you use it often: `npm i -g @unravel-tech/thing`.
 | `thing versions <name>` | Version history for an artifact |
 | `thing rollback <name> <n>` | Point latest back to version n |
 | `thing open <name>` | Open the artifact in a browser |
-| `thing mcp` | Run a Model Context Protocol server over stdio (tools: `server_info`, `push_artifact`, `list_artifacts`, `list_artifact_comments`, `whoami`) |
+| `thing pull <url\|team/artifact\|name> [version] [--output path\|-] [--force]` | Download the exact source that was pushed (latest, or a pinned version) |
+| `thing mcp` | Run a Model Context Protocol server over stdio (tools: `server_info`, `push_artifact`, `fetch_artifact`, `list_artifacts`, `list_artifact_comments`, `whoami`) |
 
 Every command accepts `--json` for machine-readable output. Authenticated
 commands also accept `--account name` to use a saved account once without
@@ -39,6 +40,28 @@ the final JSON object is always the push result. Use `--no-login` to fail fast
 instead of starting interactive authentication, such as in CI.
 
 Visibility values: `private`, `team`, `anyone-with-link` (prints a tokened share URL), `public`.
+
+## Pulling artifacts
+
+`thing pull` downloads an artifact's source byte-for-byte as it was pushed — the
+original HTML or Markdown, not the rendered page — so it can be used as context
+for a coding agent:
+
+```sh
+thing pull https://usething.ai/acme/q3-report          # saves q3-report-v4.html
+thing pull acme/q3-report 2 --output report.html       # pin version 2
+thing pull https://usething.ai/acme/q3-report --output - | less
+```
+
+It works for anything you can open in a browser, including artifacts shared
+with you as a reader that you cannot push to. Pass the URL exactly as you got it:
+a `?k=` link key and a `/v/<n>` version in the path are honoured. Public
+artifacts need no login. A bare name resolves against your own artifacts. Every
+download is checked against the server's sha256 content hash. Existing files
+are not overwritten without `--force`.
+
+The `fetch_artifact` MCP tool does the same for agents: HTML and Markdown come
+back inline, and PDFs and images are saved to a `path` you give it.
 
 ## Updates
 
