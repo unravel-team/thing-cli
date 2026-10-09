@@ -1,3 +1,4 @@
+import { mkdirSync, writeFileSync } from "node:fs";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -148,6 +149,42 @@ async function testServerEnforced426() {
   assert(JSON.parse(result.stdout()).code === "CLIENT_UPDATE_REQUIRED", "a server 426 should retain the update error code");
 }
 
+// A policy cached by an older install must not follow an upgrade: it would
+// tell someone on the new version to "update" to an older one.
+async function testCacheFromOlderVersion() {
+  const home = await mkdtemp(join(tmpdir(), "thing-cli-stale-cache-"));
+  const env = { ...process.env, XDG_CONFIG_HOME: home, THING_TOKEN: "token", THING_SERVER: "https://thing.test" };
+  mkdirSync(join(home, "thing"), { recursive: true });
+  writeFileSync(join(home, "thing", "config.json"), JSON.stringify({
+    updateChecks: {
+      "thing-cli|https://thing.test": {
+        checkedAt: Date.now(),
+        policy: { status: "update_available", client: "thing-cli", currentVersion: "0.0.1", latestVersion: "0.0.2", minimumVersion: "0.0.1" }
+      }
+    }
+  }));
+  let policyCalls = 0;
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/api/v1/client-policy") {
+      policyCalls += 1;
+      return json({ client: "thing-cli", latestVersion: "0.0.2", minimumVersion: "0.0.1", status: "current" });
+    }
+    if (url.pathname === "/api/v1/artifacts") return json({ artifacts: [] });
+    return json({ error: "unexpected request" }, 404);
+  };
+
+  const result = capture({ env });
+  assert(await run(["list"], result.io) === 0, "list should succeed");
+  assert(policyCalls === 1, "a cache written by another version should be refreshed");
+  assert(!`${result.stdout()}${result.stderr()}`.includes("Update available"), `no downgrade advice after an upgrade: ${result.stderr()}`);
+
+  // Positive: a fresh cache from this same version is still reused.
+  const again = capture({ env });
+  assert(await run(["list"], again.io) === 0, "second list should succeed");
+  assert(policyCalls === 1, "a fresh cache from this version should be reused");
+}
+
 async function testMcpAdvisory() {
   const home = await mkdtemp(join(tmpdir(), "thing-mcp-advisory-"));
   const env = { ...process.env, XDG_CONFIG_HOME: home, THING_TOKEN: "token" };
@@ -251,6 +288,7 @@ try {
   await testCliAdvisory();
   await testCliRequired();
   await testServerEnforced426();
+  await testCacheFromOlderVersion();
   await testMcpAdvisory();
   await testMcpRequired();
   await testMcpCommentTool();

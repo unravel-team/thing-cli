@@ -312,7 +312,8 @@ async function getUpdatePolicy(state, flags = {}, options = {}) {
   const now = Date.now();
   const interval = numberFromEnv(env, "THING_UPDATE_CHECK_INTERVAL_MS", UPDATE_CHECK_INTERVAL_MS);
 
-  if (!options.forceRefresh && cached && now - Number(cached.checkedAt || 0) < interval) {
+  // A policy cached by another installed version is stale whatever its age.
+  if (!options.forceRefresh && cached && cached.policy?.currentVersion === VERSION && now - Number(cached.checkedAt || 0) < interval) {
     return normalizeUpdatePolicy(cached.policy, client);
   }
 
@@ -736,6 +737,67 @@ async function whoami(parsed, state, io) {
     { ...data, account: ctx.account, accountSource: ctx.accountSource, server: ctx.server, activeTeam: ctx.team, activeProject: ctx.project },
     `${data.user.email}${ctx.account ? `\naccount: ${ctx.account} (${ctx.accountSource})` : ""}\nserver: ${ctx.server}\npushes go to: ${target}${ctx.project ? `\nproject: ${ctx.project}` : ""}`
   );
+}
+
+// Claude Code auto mode only trusts the working repo by default, so it refuses
+// `thing push` to the hosted service. Auto mode reads trust from user settings
+// only (never a plugin or the repo), so the person runs this once themselves.
+// It applies without a prompt: Claude Code `!` commands have no interactive
+// stdin, and typing the command is the consent. --remove undoes it exactly.
+const CLAUDE_TRUST = {
+  environment: [
+    "Trusted internal domains: usething.ai and *.usething.ai, the thing artifact host where this user publishes HTML and Markdown reports for themselves and their team (added by `thing setup claude`)",
+    "Org-specific CLIs: `thing` (npm @unravel-tech/thing, often run with npx) publishes artifacts to usething.ai; `thing push`, `thing list`, `thing versions`, `thing comments` and `thing open` are routine (added by `thing setup claude`)"
+  ],
+  allow: [
+    "Publishing with `thing push` or `npx @unravel-tech/thing push` to usething.ai at private or team visibility is allowed: it is the user's own artifact host. Public visibility still needs the user's explicit request (added by `thing setup claude`)"
+  ]
+};
+
+function claudeSettingsPath(env) {
+  return join(env.CLAUDE_CONFIG_DIR || join(env.HOME || homedir(), ".claude"), "settings.json");
+}
+
+async function setupCommand(parsed, state, io) {
+  const [target] = parsed.positionals;
+  if (target !== "claude") throw new CliError("Usage: thing setup claude [--remove] [--dry-run]");
+  const path = claudeSettingsPath(io.env || process.env);
+  let settings;
+  try {
+    settings = readJson(path);
+  } catch {
+    throw new CliError(`${path} is not valid JSON; fix it and run thing setup claude again.`);
+  }
+  if (!isRecord(settings)) throw new CliError(`${path} is not a JSON object.`);
+  const remove = Boolean(parsed.flags.remove);
+  const autoMode = isRecord(settings.autoMode) ? settings.autoMode : {};
+  const changed = [];
+  for (const [key, entries] of Object.entries(CLAUDE_TRUST)) {
+    const current = Array.isArray(autoMode[key]) ? autoMode[key] : null;
+    if (remove) {
+      if (!current) continue;
+      const kept = current.filter((entry) => !entries.includes(entry));
+      if (kept.length !== current.length) changed.push(...entries.filter((entry) => current.includes(entry)));
+      // A list that held only "$defaults" plus ours goes back to unset.
+      if (kept.length === 0 || (kept.length === 1 && kept[0] === "$defaults")) delete autoMode[key];
+      else autoMode[key] = kept;
+    } else {
+      // "$defaults" keeps Claude Code's built-in rules; a list the person
+      // already owns without it is left that way.
+      const next = current ? [...current] : ["$defaults"];
+      for (const entry of entries) if (!next.includes(entry)) { next.push(entry); changed.push(entry); }
+      autoMode[key] = next;
+    }
+  }
+  if (Object.keys(autoMode).length) settings.autoMode = autoMode;
+  else delete settings.autoMode;
+  if (changed.length && !parsed.flags["dry-run"]) writeJson(path, settings);
+
+  const verb = parsed.flags["dry-run"] ? (remove ? "Would remove" : "Would add") : remove ? "Removed" : "Added";
+  const text = changed.length
+    ? `${verb} Claude Code auto-mode trust for thing in ${path}:\n${changed.map((entry) => `  - ${entry}`).join("\n")}${remove ? "" : "\nUndo with: thing setup claude --remove"}`
+    : remove ? "No thing entries to remove." : `Claude Code already trusts thing (${path}).`;
+  output(io, parsed.json, { path, changed, removed: remove, dryRun: Boolean(parsed.flags["dry-run"]) }, text);
 }
 
 async function useContext(parsed, state, io) {
@@ -1217,6 +1279,7 @@ Commands:
   switch --clear-local
   logout [--account name] [--all]
   whoami
+  setup claude [--remove] [--dry-run]   # let Claude Code auto mode push to thing
   use <team> [project]
   default [team] [--clear]
   push <file.html|.md|.pdf|.png|.jpg|.gif|.webp> [--name x] [--team t] [--project p] [--visibility private|team|public] [--password p] [--no-login] [--no-browser]
@@ -1273,6 +1336,9 @@ export async function run(argv = process.argv.slice(2), io = { stdout: process.s
         break;
       case "whoami":
         await whoami(parsed, state, io);
+        break;
+      case "setup":
+        await setupCommand(parsed, state, io);
         break;
       case "use":
         await useContext(parsed, state, io);
