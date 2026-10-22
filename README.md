@@ -26,11 +26,20 @@ globally if you use it often: `npm i -g @unravel-tech/thing`.
 | `thing use <team> [project]` | Set a local active team/project override for this machine |
 | `thing push <file.html\|.md\|.pdf\|.png\|.jpg\|.gif\|.webp> [--name x] [--team t] [--project p] [--visibility v] [--password p]` | Authenticate if needed, then push a new immutable version and print the served URL. `--visibility` is `private` (only you and people you add), `team` (everyone in the org, the default) or `public` (anyone with the link). `--password` lets anyone who knows it open the artifact beside team and people access |
 | `thing list` | List artifacts you can see; filter with `--label` or `--search`, sort with `--sort created` or `updated` and `--order asc` or `desc`, page with `--limit` and `--offset` |
+| `thing get <name> [--version n] [--output file]` | Read the pushed source of a version. HTML and Markdown print to stdout; PDFs and images save under their download name (never overwriting) or to `--output` |
 | `thing comments <name>` | Pull comments and replies from a viewable artifact |
-| `thing versions <name>` | Version history for an artifact |
+| `thing versions <name>` | Version history for an artifact; works for viewers and public links |
+| `thing responses <name> [--mine] [--collection c] [--history] [--csv]` | Read a page's Inputs answers (every respondent for publishers and editors). Each row says whether it came from the browser or an agent |
+| `thing respond <name> <collection> (--data '{json}' \| --field key=value ...) [--version n]` | Answer a page's Inputs as the signed-in user. `--field` repeats and types `true`, `false`, `null` and numbers. Recorded as `via: agent` |
 | `thing rollback <name> <n>` | Point latest back to version n |
 | `thing open <name>` | Open the artifact in a browser |
-| `thing mcp` | Run a Model Context Protocol server over stdio (tools: `server_info`, `push_artifact`, `list_artifacts`, `list_artifact_comments`, `whoami`) |
+| `thing mcp` | Run a Model Context Protocol server over stdio (tools: `server_info`, `push_artifact`, `list_artifacts`, `get_artifact`, `list_artifact_versions`, `list_artifact_comments`, `list_artifact_responses`, `submit_artifact_response`, `whoami`) |
+
+`<name>` is an artifact name, `team/slug`, or a pasted link. A `/v/N` link pins
+that version and `?k=` link keys are kept. A link on another host is read
+without your token unless your own server confirms it is the same artifact.
+`push` prints any server `notes` (for example an Inputs mistake) to stderr and
+includes them in `--json`.
 
 Every command accepts `--json` for machine-readable output. Authenticated
 commands also accept `--account name` to use a saved account once without
@@ -139,10 +148,15 @@ On a machine that has Bun but no Node, swap `npx` for `bunx`:
 }
 ```
 
-The server exposes four tools: `server_info` for the installed version and
+The server exposes these tools: `server_info` for the installed version and
 update status, `push_artifact` to publish a file or inline content and get back
-a link, `list_artifacts` to see what you have, and `whoami` to check which
-account and team you are pushing to.
+a link (with any server `notes`), `list_artifacts` to see what you have,
+`get_artifact` to read a version's source (text inline, PDFs and images saved
+to `save_to`), `list_artifact_versions`, `list_artifact_comments`,
+`list_artifact_responses` to read a page's Inputs answers,
+`submit_artifact_response` to answer them for the user when asked, and
+`whoami` to check which account and team you are pushing to. Every tool that
+takes an artifact accepts a name, `team/slug`, or link.
 
 If you already ran `thing login`, the stored credential is used and
 `THING_TOKEN` can be left out.
