@@ -9,6 +9,7 @@
 import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { basename, dirname, extname, join, resolve } from "node:path";
 import { homedir } from "node:os";
+import { randomUUID } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 
@@ -182,7 +183,8 @@ function parseArgv(argv) {
     if (!next || next.startsWith("--")) {
       flags[key] = true;
     } else {
-      flags[key] = next;
+      // --field repeats (thing respond); every other flag keeps its last value.
+      flags[key] = key === "field" ? [...(flags[key] || []), next] : next;
       i += 1;
     }
   }
@@ -880,7 +882,69 @@ async function commentsCommand(parsed, state, io) {
   output(io, parsed.json, { artifact: data.artifact || artifact, comments }, text);
 }
 
+// A pasted link or team/slug reaches artifacts outside the user's own list:
+// shared with them, public, or opened with a ?k= link key. For a link on
+// another host, `ctx` is null until resolveRef decides whose it is.
+function artifactRef(ctx, ref) {
+  let url = null;
+  try {
+    url = new URL(ref);
+  } catch {
+    // not a link
+  }
+  if (url && (url.protocol === "https:" || url.protocol === "http:")) {
+    const parts = url.pathname.split("/").filter(Boolean).map(decodeURIComponent);
+    if (parts.length < 2) throw new CliError(`Not an artifact link: ${ref}`);
+    const version = parts[2] === "v" && /^\d+$/.test(parts[3] || "") ? Number(parts[3]) : null;
+    const origin = stripSlash(url.origin);
+    return {
+      ctx: origin === ctx.server ? ctx : null,
+      origin,
+      team: parts[0],
+      slug: parts[1],
+      version,
+      key: url.searchParams.get("k")
+    };
+  }
+  const match = /^([a-z0-9][a-z0-9-]*)\/([a-z0-9][a-z0-9._-]*)$/.exec(ref);
+  return match ? { ctx, team: match[1], slug: match[2], version: null, key: null } : null;
+}
+
+function byPath(ref, suffix = "") {
+  const base = `/api/v1/artifacts/by-path/${encodeURIComponent(ref.team)}/${encodeURIComponent(ref.slug)}${suffix}`;
+  return ref.key ? `${base}?k=${encodeURIComponent(ref.key)}` : base;
+}
+
+// Resolves a name, team/slug or link to { ctx, team, slug, version, key, artifact, meta }.
+// `meta` is the by-path metadata: versions with ids, latest version, access.
+async function resolveRef(ctx, name) {
+  let ref = artifactRef(ctx, name);
+  if (!ref) {
+    const found = await resolveArtifact(ctx, name);
+    ref = { ctx, team: found.teamSlug, slug: found.slug, version: null, key: null };
+  }
+  let meta;
+  if (!ref.ctx) {
+    // The account's server may answer under another host (an old domain, the
+    // fly.dev name). Ask it first and keep the token only if the artifact URL
+    // it reports is on the link's host; the token never goes to that host.
+    const own = ctx.token ? await api(ctx, byPath(ref)).catch(() => null) : null;
+    const same = own?.artifact?.url && stripSlash(new URL(own.artifact.url).origin) === ref.origin;
+    ref.ctx = same ? ctx : { ...ctx, server: ref.origin, token: null };
+    if (same) meta = own;
+  }
+  try {
+    meta ??= await api(ref.ctx, byPath(ref));
+  } catch (error) {
+    if (error.message === "not found") throw new CliError(`Artifact not found: ${name}${ref.ctx.token ? "" : ". If it is not public, sign in with `thing login`."}`);
+    throw error;
+  }
+  const artifact = { ...meta.artifact, teamSlug: meta.artifact.team };
+  return { ...ref, artifact, meta };
+}
+
 async function resolveArtifact(ctx, name) {
+  if (artifactRef(ctx, name)) return (await resolveRef(ctx, name)).artifact;
   const slug = slugify(name);
   const data = await api(ctx, "/api/v1/artifacts");
   const artifacts = data.artifacts || [];
@@ -894,8 +958,140 @@ async function resolveArtifact(ctx, name) {
   return matches[0];
 }
 
-async function detail(ctx, artifact) {
-  return api(ctx, `/api/v1/artifacts/${encodeURIComponent(artifact.id)}`);
+function isTextType(contentType) {
+  return /^text\/|^application\/(json|xml)|\+xml/.test(contentType || "");
+}
+
+// Source bytes of one version (the pushed file, not the served page).
+async function downloadVersion(ref, version) {
+  const response = await fetch(`${ref.ctx.server}${byPath(ref, version ? `/v/${version}/download` : "/download")}`, {
+    headers: { "X-Thing-Client": clientName, ...(ref.ctx.token ? { Authorization: `Bearer ${ref.ctx.token}` } : {}) }
+  });
+  if (!response.ok) {
+    let message = `${response.status} ${response.statusText}`;
+    try {
+      message = (await response.json()).error || message;
+    } catch {
+      // keep the status line
+    }
+    throw new CliError(message === "not found" ? `Version not found: v${version}` : message);
+  }
+  const contentType = response.headers.get("content-type") || "application/octet-stream";
+  const filename = /filename="([^"]+)"/.exec(response.headers.get("content-disposition") || "")?.[1] || `${ref.slug}.bin`;
+  return {
+    bytes: Buffer.from(await response.arrayBuffer()),
+    contentType,
+    filename: basename(filename),
+    version: Number(response.headers.get("x-thing-version")) || version || null
+  };
+}
+
+// Reads a version: text inline unless an output path is given; binaries are
+// always written to a file, never returned inline or overwritten.
+async function readArtifact(ctx, name, { version, output, cwd }) {
+  const ref = await resolveRef(ctx, name);
+  const wanted = version ? Number(version) : ref.version;
+  if (wanted != null && (!Number.isInteger(wanted) || wanted <= 0)) throw new CliError("Version must be a positive integer.");
+  const file = await downloadVersion(ref, wanted);
+  const result = { artifact: ref.artifact, version: file.version, contentType: file.contentType };
+  if (!output && isTextType(file.contentType)) return { ...result, content: file.bytes.toString("utf8") };
+  const path = resolve(cwd || process.cwd(), output || file.filename);
+  if (!output && existsSync(path)) throw new CliError(`${path} already exists. Pass --output <file> to choose where to save it.`);
+  writeFileSync(path, file.bytes);
+  return { ...result, path };
+}
+
+async function readResponses(ctx, name, { mine, collection, history, csv }) {
+  const { artifact, ctx: refCtx } = await resolveRef(ctx, name);
+  const base = `/api/v1/artifacts/${encodeURIComponent(artifact.id)}/responses`;
+  const query = new URLSearchParams({ scope: mine ? "mine" : "all" });
+  if (collection) query.set("collection", collection);
+  if (history) query.set("history", "1");
+  if (csv) {
+    query.set("format", "csv");
+    return { artifact, csv: (await api(refCtx, `${base}?${query}`)).text || "" };
+  }
+  const responses = [];
+  let total = 0;
+  do {
+    query.set("limit", "100");
+    query.set("offset", String(responses.length));
+    const page = await api(refCtx, `${base}?${query}`);
+    total = page.total || 0;
+    if (!page.responses?.length) break;
+    responses.push(...page.responses);
+  } while (responses.length < total);
+  return { artifact, total, responses };
+}
+
+// Answers are recorded as the signed-in account, against one version.
+async function submitResponse(ctx, name, { collection, data, version }) {
+  if (typeof collection !== "string" || !/^[a-z][a-z0-9_-]{0,63}$/.test(collection)) throw new CliError("Collection must match [a-z][a-z0-9_-]{0,63}, as declared in the page's thing:inputs meta.");
+  if (!isRecord(data) || Array.isArray(data) || !Object.keys(data).length) throw new CliError("Answers must be a JSON object with at least one field.");
+  const ref = await resolveRef(ctx, name);
+  requireToken(ref.ctx);
+  const number = version ? Number(version) : ref.version ?? ref.meta.artifact.latestVersion;
+  const target = (ref.meta.versions || []).find((v) => v.number === number);
+  if (!target?.id) throw new CliError(`Version not found: v${number}`);
+  return api(ref.ctx, `/api/v1/artifacts/${encodeURIComponent(ref.artifact.id)}/responses`, {
+    method: "POST",
+    body: { collection, versionId: target.id, requestId: randomUUID(), data }
+  });
+}
+
+function typedField(value) {
+  if (value === "true") return true;
+  if (value === "false") return false;
+  if (value === "null") return null;
+  if (/^-?\d+(\.\d+)?$/.test(value)) return Number(value);
+  return value;
+}
+
+function answersFromFlags(flags) {
+  if (typeof flags.data === "string") {
+    try {
+      return JSON.parse(flags.data);
+    } catch {
+      throw new CliError("--data must be a JSON object.");
+    }
+  }
+  const fields = [].concat(flags.field || []);
+  return Object.fromEntries(fields.map((field) => {
+    const eq = String(field).indexOf("=");
+    if (eq < 1) throw new CliError(`--field takes key=value, got: ${field}`);
+    return [field.slice(0, eq), typedField(field.slice(eq + 1))];
+  }));
+}
+
+async function getCommand(parsed, state, io) {
+  const [name] = parsed.positionals;
+  if (!name) throw new CliError("Usage: thing get <name|team/slug|link> [--version n] [--output file]");
+  const ctx = context(state, parsed.flags);
+  const result = await readArtifact(ctx, name, { version: parsed.flags.version, output: parsed.flags.output, cwd: state.cwd });
+  output(io, parsed.json, result, result.content ?? result.path);
+}
+
+async function responsesCommand(parsed, state, io) {
+  const [name] = parsed.positionals;
+  if (!name) throw new CliError("Usage: thing responses <name|team/slug|link> [--mine] [--collection c] [--history] [--csv]");
+  const ctx = context(state, parsed.flags);
+  requireToken(ctx);
+  const result = await readResponses(ctx, name, { mine: parsed.flags.mine, collection: parsed.flags.collection, history: parsed.flags.history, csv: parsed.flags.csv });
+  if (result.csv !== undefined) {
+    io.stdout.write(result.csv.endsWith("\n") ? result.csv : `${result.csv}\n`);
+    return;
+  }
+  const rows = result.responses.map((r) => `v${r.version}\t${r.collection}\t${r.respondent?.name || r.respondent?.email || "you"}\t${r.via === "agent" ? `agent (${r.client || "api"})` : r.via || "unknown"}\t${JSON.stringify(r.data)}`);
+  output(io, parsed.json, result, rows.length ? rows.join("\n") : "No responses");
+}
+
+async function respondCommand(parsed, state, io) {
+  const [name, collection] = parsed.positionals;
+  if (!name || !collection) throw new CliError("Usage: thing respond <name|team/slug|link> <collection> (--data '{json}' | --field key=value ...) [--version n]");
+  const ctx = context(state, parsed.flags);
+  requireToken(ctx);
+  const saved = await submitResponse(ctx, name, { collection, data: answersFromFlags(parsed.flags), version: parsed.flags.version });
+  output(io, parsed.json, saved, `Saved ${collection} on v${saved.version}`);
 }
 
 // HTML rides as text; Markdown and media ride as base64 bytes with their real
@@ -937,7 +1133,9 @@ async function pushToServer(ctx, { doc, name, visibility, password }) {
     url: pushed.artifact.url,
     visibility: pushed.artifact.visibility,
     hasPassword: Boolean(pushed.artifact.hasPassword),
-    tokenedUrl: null
+    tokenedUrl: null,
+    // Server warnings about the pushed page, e.g. an Inputs mistake.
+    notes: pushed.notes || []
   };
 }
 
@@ -955,16 +1153,17 @@ async function push(parsed, state, io) {
     password: parsed.flags.password
   });
   output(io, parsed.json, result, result.url);
+  if (!parsed.json) for (const note of result.notes) io.stderr.write(`note: ${note}\n`);
 }
 
 async function versionsCommand(parsed, state, io) {
   const [name] = parsed.positionals;
   if (!name) throw new CliError("Usage: thing versions <name>");
-  const ctx = context(state, parsed.flags);
-  requireToken(ctx);
-  const artifact = await resolveArtifact(ctx, name);
-  const full = await detail(ctx, artifact);
-  output(io, parsed.json, full, full.versions.length ? full.versions.map((v) => `v${v.number}\t${v.id === full.artifact.latestVersionId ? "latest" : ""}\t${v.createdAt}`).join("\n") : "No versions");
+  // By-path metadata, so viewers and public links can list versions too.
+  const ref = await resolveRef(context(state, parsed.flags), name);
+  const full = { artifact: ref.artifact, versions: ref.meta.versions || [], access: ref.meta.access };
+  const latest = ref.meta.artifact.latestVersion;
+  output(io, parsed.json, full, full.versions.length ? full.versions.map((v) => `v${v.number}\t${v.number === latest ? "latest" : ""}\t${v.createdAt}`).join("\n") : "No versions");
 }
 
 async function rollback(parsed, state, io) {
@@ -1047,7 +1246,7 @@ async function updateCommandHandler(parsed, state, io) {
 
 // --- MCP server (`thing mcp`) ---------------------------------------------
 // Newline-delimited JSON-RPC 2.0 over stdio, per the Model Context Protocol.
-// Zero dependencies: four tools that reuse the CLI's own auth and push path,
+// Zero dependencies: tools that reuse the CLI's own auth and push path,
 // so any MCP client (Claude Code, Cursor, a desktop assistant) can publish
 // artifacts through the user's existing `thing login`.
 
@@ -1061,7 +1260,7 @@ const MCP_TOOLS = [
   {
     name: "push_artifact",
     description:
-      "Use this whenever the user wants to share, send, show, or publish something you produced: a report, a dashboard, a prototype, a Markdown doc, a PDF, an image. Publishes it to a durable URL that stays live, and returns the link. Pushing the same name again creates a new version at the same link rather than a second link, so prefer reusing a name over inventing one. Pass either `path` (html, md, pdf, png, jpg, gif, webp) or inline `content` with a `filename` (html or md).",
+      "Use this whenever the user wants to share, send, show, or publish something you produced: a report, a dashboard, a prototype, a Markdown doc, a PDF, an image. Publishes it to a durable URL that stays live, and returns the link. Pushing the same name again creates a new version at the same link rather than a second link, so prefer reusing a name over inventing one. Pass either `path` (html, md, pdf, png, jpg, gif, webp) or inline `content` with a `filename` (html or md). If the page collects answers or signs people in, read https://usething.ai/html-api.txt first, and act on any `notes` in the result.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1109,6 +1308,63 @@ const MCP_TOOLS = [
     }
   },
   {
+    name: "get_artifact",
+    description:
+      "Use this to read what an artifact contains before revising it, answering it, or summarising it: the pushed source of the latest version or a pinned one. HTML and Markdown come back inline as `content`; PDFs and images are saved to `save_to` and the path is returned. Works with a link the user pastes, including artifacts shared with them or public ones.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        artifact: { type: "string", description: "Artifact name, team/slug, or its link (a /v/N link pins that version)" },
+        version: { type: "integer", minimum: 1, description: "Version number; defaults to the latest" },
+        save_to: { type: "string", description: "File path to save the content to (required for PDFs and images)" },
+        team: { type: "string", description: "Team slug when the artifact name is ambiguous" }
+      },
+      required: ["artifact"]
+    }
+  },
+  {
+    name: "list_artifact_versions",
+    description:
+      "Use this to see an artifact's version history (number, size, date) and whether the user may push to it (`access`: editor or viewer).",
+    inputSchema: {
+      type: "object",
+      properties: { artifact: { type: "string", description: "Artifact name, team/slug, or its link (a /v/N link pins that version)" }, team: { type: "string", description: "Team slug when the artifact name is ambiguous" } },
+      required: ["artifact"]
+    }
+  },
+  {
+    name: "list_artifact_responses",
+    description:
+      "Use this to read answers people gave in a page's Inputs (thing:inputs collections). Publishers and editors see everyone's latest answers with names; pass mine to read only the user's own. Returns every page of results.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        artifact: { type: "string", description: "Artifact name, team/slug, or its link (a /v/N link pins that version)" },
+        mine: { type: "boolean", description: "Only the signed-in user's own answers" },
+        collection: { type: "string", description: "Only this collection" },
+        history: { type: "boolean", description: "Include earlier submissions, not just the latest per person" },
+        team: { type: "string", description: "Team slug when the artifact name is ambiguous" }
+      },
+      required: ["artifact"]
+    }
+  },
+  {
+    name: "submit_artifact_response",
+    description:
+      "Use this only when the user asks you to answer a page's Inputs for them. Saves `data` to a collection the page declares, recorded as the signed-in user, on the latest version or the one given. Read the page with get_artifact first to learn the collection names and the fields it expects.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        artifact: { type: "string", description: "Artifact name, team/slug, or its link (a /v/N link pins that version)" },
+        collection: { type: "string", description: "Collection name from the page's thing:inputs meta" },
+        data: { type: "object", description: "Flat object of up to 64 string, number, boolean or null fields" },
+        version: { type: "integer", minimum: 1, description: "Version number; defaults to the latest" },
+        team: { type: "string", description: "Team slug when the artifact name is ambiguous" }
+      },
+      required: ["artifact", "collection", "data"]
+    }
+  },
+  {
     name: "whoami",
     description:
       "Use this to confirm the user is signed in and which team will own a new artifact. Shows the account, the server, and where pushes land when no team is named.",
@@ -1144,6 +1400,21 @@ async function mcpTool(state, parsed, name, args, runtime = {}) {
     const artifact = await resolveArtifact(ctx, args.name);
     const data = await api(ctx, `/api/v1/artifacts/${encodeURIComponent(artifact.id)}/comments`);
     return { artifact: data.artifact || artifact, comments: data.comments || [] };
+  }
+  const target = typeof args.artifact === "string" && args.artifact.trim() ? args.artifact.trim() : null;
+  if (["get_artifact", "list_artifact_versions", "list_artifact_responses", "submit_artifact_response"].includes(name) && !target) throw new CliError("`artifact` is required: a name, team/slug, or link.");
+  if (name === "get_artifact") return readArtifact(ctx, target, { version: args.version, output: args.save_to, cwd: state.cwd });
+  if (name === "list_artifact_versions") {
+    const ref = await resolveRef(ctx, target);
+    return { artifact: ref.artifact, versions: ref.meta.versions || [], access: ref.meta.access };
+  }
+  if (name === "list_artifact_responses") {
+    requireToken(ctx);
+    return readResponses(ctx, target, { mine: args.mine, collection: args.collection, history: args.history });
+  }
+  if (name === "submit_artifact_response") {
+    requireToken(ctx);
+    return submitResponse(ctx, target, { collection: args.collection, data: args.data, version: args.version });
   }
   if (name === "push_artifact") {
     requireToken(ctx);
@@ -1284,10 +1555,15 @@ Commands:
   default [team] [--clear]
   push <file.html|.md|.pdf|.png|.jpg|.gif|.webp> [--name x] [--team t] [--project p] [--visibility private|team|public] [--password p] [--no-login] [--no-browser]
   list [--team t] [--label l] [--search text] [--sort updated|created] [--order desc|asc] [--limit n] [--offset n]
+  get <name|team/slug|link> [--version n] [--output file]   # read a version's source
   comments <name>
   versions <name>
+  responses <name> [--mine] [--collection c] [--history] [--csv]   # Inputs answers
+  respond <name> <collection> (--data '{json}' | --field key=value ...) [--version n]
   rollback <name> <version>
   open <name>
+
+  <name> may also be team/slug or a link, including /v/N and ?k= links.
   mcp [--version]         # Model Context Protocol server over stdio
 
 Global options:
@@ -1358,6 +1634,15 @@ export async function run(argv = process.argv.slice(2), io = { stdout: process.s
       case "versions":
         await versionsCommand(parsed, state, io);
         break;
+      case "get":
+        await getCommand(parsed, state, io);
+        break;
+      case "responses":
+        await responsesCommand(parsed, state, io);
+        break;
+      case "respond":
+        await respondCommand(parsed, state, io);
+        break;
       case "rollback":
         await rollback(parsed, state, io);
         break;
@@ -1386,6 +1671,9 @@ export async function run(argv = process.argv.slice(2), io = { stdout: process.s
     return error.exitCode || 1;
   }
 }
+
+// For tests: the MCP tool surface and config loading without a stdio session.
+export { MCP_TOOLS, mcpTool, loadState };
 
 const invokedPath = process.argv[1] ? realpathSync(process.argv[1]) : "";
 if (import.meta.url === pathToFileURL(invokedPath).href) {
