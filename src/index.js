@@ -1063,6 +1063,33 @@ function answersFromFlags(flags) {
   }));
 }
 
+// thing export --all: one zip of everything the account holds (or --team
+// <slug> for a team admin), because artifacts expire 30 days after their
+// newest push. Never overwrites an existing file.
+async function exportCommand(parsed, state, io) {
+  const team = typeof parsed.flags.team === "string" ? parsed.flags.team : null;
+  if (!parsed.flags.all && !team) throw new CliError("Usage: thing export --all [--output file] | thing export --team <slug> [--output file]");
+  const ctx = context(state, parsed.flags);
+  requireToken(ctx);
+  const path = team ? `/t/${encodeURIComponent(team)}/export` : "/api/v1/export";
+  const response = await fetch(`${ctx.server}${path}`, { headers: { "X-Thing-Client": clientName, Authorization: `Bearer ${ctx.token}` } });
+  if (!response.ok) {
+    let message = `${response.status} ${response.statusText}`;
+    try {
+      message = (await response.json()).error || message;
+    } catch {
+      // keep the status line
+    }
+    throw new CliError(response.status === 403 ? `Export refused: ${message}` : message);
+  }
+  const fallback = `thing-export-${team || "account"}-${new Date().toISOString().slice(0, 10)}.zip`;
+  const target = resolve(state.cwd || process.cwd(), typeof parsed.flags.output === "string" ? parsed.flags.output : fallback);
+  if (existsSync(target)) throw new CliError(`${target} already exists. Pass --output <file> to choose another name.`);
+  const bytes = Buffer.from(await response.arrayBuffer());
+  writeFileSync(target, bytes);
+  output(io, parsed.json, { path: target, bytes: bytes.length }, `Saved ${target} (${bytes.length} bytes)`);
+}
+
 async function getCommand(parsed, state, io) {
   const [name] = parsed.positionals;
   if (!name) throw new CliError("Usage: thing get <name|team/slug|link> [--version n] [--output file]");
@@ -1556,6 +1583,7 @@ Commands:
   push <file.html|.md|.pdf|.png|.jpg|.gif|.webp> [--name x] [--team t] [--project p] [--visibility private|team|public] [--password p] [--no-login] [--no-browser]
   list [--team t] [--label l] [--search text] [--sort updated|created] [--order desc|asc] [--limit n] [--offset n]
   get <name|team/slug|link> [--version n] [--output file]   # read a version's source
+  export --all [--output file] | export --team <slug>   # download everything in one zip
   comments <name>
   versions <name>
   responses <name> [--mine] [--collection c] [--history] [--csv]   # Inputs answers
@@ -1633,6 +1661,9 @@ export async function run(argv = process.argv.slice(2), io = { stdout: process.s
         break;
       case "versions":
         await versionsCommand(parsed, state, io);
+        break;
+      case "export":
+        await exportCommand(parsed, state, io);
         break;
       case "get":
         await getCommand(parsed, state, io);
