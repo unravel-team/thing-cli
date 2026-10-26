@@ -116,6 +116,19 @@ artifacts. A project groups artifacts inside a workspace and can be restricted t
 the people added to it; people from outside the workspace can be added to a project
 as guests. Push into one with `--project <slug>`.
 
+Manage projects from the CLI or MCP:
+
+```
+thing projects --team acme
+thing project create "Q4 launch" --team acme --restricted --brief "Ship by week 3"
+thing project add acme/q4-launch dana@client.example --role editor
+thing project set acme/q4-launch --access open --archive
+thing push index.html --team acme --project q4-launch --home   # the project's page
+```
+
+A project's page can be one of its artifacts. Inside it, `thing.project.get()`
+lists the project's artifacts with each reader's own access.
+
 Which workspace a push lands in is decided in order: `--team` flag → `.thing.json` in the
 working directory → a local `thing use` override → your **server-side default**
 (`thing default`) → your personal space. Login no longer pins a workspace, so with none of

@@ -1139,7 +1139,7 @@ function docFromFile(path) {
 // `password` is a second door beside team and people access: anyone who knows
 // it can open the artifact. Sent only when given, so re-pushing without it
 // keeps whatever is set.
-async function pushToServer(ctx, { doc, name, visibility, password }) {
+async function pushToServer(ctx, { doc, name, visibility, password, home }) {
   requireToken(ctx);
   if (visibility && !VISIBILITIES.has(visibility)) throw new CliError("Invalid visibility. Use private, team or public.");
   const pushed = await api(ctx, "/api/v1/artifacts", {
@@ -1151,6 +1151,8 @@ async function pushToServer(ctx, { doc, name, visibility, password }) {
       title: name,
       visibility: visibility || undefined,
       password: password || undefined,
+      // Make this artifact its project's page (needs --project).
+      home: home ? true : undefined,
       ...doc
     }
   });
@@ -1177,7 +1179,8 @@ async function push(parsed, state, io) {
     doc,
     name: parsed.flags.name || titleFromFile(path),
     visibility: parsed.flags.visibility,
-    password: parsed.flags.password
+    password: parsed.flags.password,
+    home: parsed.flags.home === true || parsed.flags.home === "true"
   });
   output(io, parsed.json, result, result.url);
   if (!parsed.json) for (const note of result.notes) io.stderr.write(`note: ${note}\n`);
@@ -1191,6 +1194,82 @@ async function versionsCommand(parsed, state, io) {
   const full = { artifact: ref.artifact, versions: ref.meta.versions || [], access: ref.meta.access };
   const latest = ref.meta.artifact.latestVersion;
   output(io, parsed.json, full, full.versions.length ? full.versions.map((v) => `v${v.number}\t${v.number === latest ? "latest" : ""}\t${v.createdAt}`).join("\n") : "No versions");
+}
+
+// Projects (server: projects.feature). A project is named by its id,
+// team/slug, or slug in the current workspace.
+async function resolveProject(ctx, ref) {
+  if (!ref) throw new CliError("A project is required: team/slug, or a slug with --team.");
+  if (/^proj_/.test(ref)) return { id: ref };
+  const [team, slug] = ref.includes("/") ? ref.split("/") : [ctx.team, ref];
+  const { projects } = await api(ctx, "/api/v1/projects");
+  const found = projects.find((p) => p.slug === slug && (!team || p.team === team));
+  if (!found) throw new CliError(`Project not found: ${ref}`);
+  return found;
+}
+
+async function listProjects(ctx, args = {}) {
+  const { projects } = await api(ctx, "/api/v1/projects");
+  const team = args.team || null;
+  return { projects: team ? projects.filter((p) => p.team === team) : projects };
+}
+
+async function projectUpdate(ctx, ref, fields) {
+  const project = await resolveProject(ctx, ref);
+  const body = {};
+  for (const key of ["name", "brief", "access", "slug"]) if (typeof fields[key] === "string") body[key] = fields[key];
+  if (fields.access && !["open", "restricted"].includes(fields.access)) throw new CliError("Access is open or restricted.");
+  if (typeof fields.archived === "boolean") body.archived = fields.archived;
+  if (fields.home !== undefined) body.home = !fields.home || fields.home === "none" ? null : (await resolveRef(ctx, String(fields.home))).artifact.id;
+  return api(ctx, `/api/v1/projects/${encodeURIComponent(project.id)}`, { method: "PATCH", body });
+}
+
+async function projectsCommand(parsed, state, io) {
+  const ctx = context(state, parsed.flags);
+  requireToken(ctx);
+  const data = await listProjects(ctx, { team: parsed.flags.team });
+  output(io, parsed.json, data, data.projects.length ? data.projects.map((p) => `${p.team}/${p.slug}\t${p.name}\t${p.access}${p.archived ? "\tarchived" : ""}${p.guest ? "\tguest" : ""}`).join("\n") : "No projects");
+}
+
+async function projectCommand(parsed, state, io) {
+  const [sub, ref, extra] = parsed.positionals;
+  const ctx = context(state, parsed.flags);
+  requireToken(ctx);
+  const f = parsed.flags;
+  if (sub === "create") {
+    const team = f.team || ctx.team;
+    if (!ref || !team) throw new CliError("Usage: thing project create <name> --team <workspace> [--restricted] [--brief text]");
+    const data = await api(ctx, `/api/v1/teams/${encodeURIComponent(team)}/projects`, { method: "POST", body: { name: ref, access: f.restricted ? "restricted" : "open", brief: typeof f.brief === "string" ? f.brief : undefined } });
+    return output(io, parsed.json, data, `Created ${data.project.name}: ${data.project.url}`);
+  }
+  if (sub === "show") {
+    const project = await resolveProject(ctx, ref);
+    const data = await api(ctx, `/api/v1/projects/${encodeURIComponent(project.id)}`);
+    const people = (data.members || []).map((m) => `  ${m.name || m.email || "Invited person"}\t${m.role}${m.guest ? "\tguest" : ""}`).join("\n");
+    return output(io, parsed.json, data, `${data.project.name} (${data.project.access}${data.project.archived ? ", archived" : ""})\n${data.project.url}\n${people}`);
+  }
+  if (sub === "add") {
+    if (!extra) throw new CliError("Usage: thing project add <project> <email> [--role viewer|commenter|editor|owner]");
+    const project = await resolveProject(ctx, ref);
+    const data = await api(ctx, `/api/v1/projects/${encodeURIComponent(project.id)}/members`, { method: "POST", body: { email: extra, role: typeof f.role === "string" ? f.role : "viewer" } });
+    return output(io, parsed.json, data, `Added ${extra}`);
+  }
+  if (sub === "remove") {
+    if (!extra) throw new CliError("Usage: thing project remove <project> <email>");
+    const project = await resolveProject(ctx, ref);
+    const data = await api(ctx, `/api/v1/projects/${encodeURIComponent(project.id)}/members/${encodeURIComponent(extra)}`, { method: "DELETE" });
+    return output(io, parsed.json, data, `Removed ${extra}`);
+  }
+  if (sub === "set") {
+    const data = await projectUpdate(ctx, ref, { name: f.name, brief: f.brief, access: f.access, slug: f.slug, home: f.home, archived: f.archive ? true : f.restore ? false : undefined });
+    return output(io, parsed.json, data, `Saved ${data.project.name}`);
+  }
+  if (sub === "delete") {
+    const project = await resolveProject(ctx, ref);
+    const data = await api(ctx, `/api/v1/projects/${encodeURIComponent(project.id)}`, { method: "DELETE" });
+    return output(io, parsed.json, data, "Deleted");
+  }
+  throw new CliError("Usage: thing project create|show|add|remove|set|delete ...");
 }
 
 async function rollback(parsed, state, io) {
@@ -1298,7 +1377,8 @@ const MCP_TOOLS = [
         team: { type: "string", description: "Workspace address to push to (a workspace is called a team in the API; defaults to the user's default workspace)" },
         project: { type: "string", description: "Project slug in that workspace. Restricted projects are seen only by their members and workspace admins; guests from outside the workspace can push only into projects where they are editors" },
         visibility: { type: "string", enum: ["private", "team", "public"], description: "Who can see it: private is only you and people you add, team is everyone in the workspace (or, in a project, the project's people), public is anyone with the link" },
-        password: { type: "string", description: "Set a password; anyone who knows it can open the artifact beside workspace and people access" }
+        password: { type: "string", description: "Set a password; anyone who knows it can open the artifact beside workspace and people access" },
+        home: { type: "boolean", description: "Make this artifact the project's page (needs project; project owners and editors only). Inside it, thing.project.get() lists the project's artifacts for each reader" }
       }
     }
   },
@@ -1392,6 +1472,36 @@ const MCP_TOOLS = [
     }
   },
   {
+    name: "list_projects",
+    description: "Use this to see the projects the user can reach, optionally in one workspace. Projects group a workspace's artifacts; restricted ones are seen only by their members and workspace admins, and guests from outside the workspace see only their projects.",
+    inputSchema: { type: "object", properties: { team: { type: "string", description: "Workspace address to filter by" } } }
+  },
+  {
+    name: "create_project",
+    description: "Use this to start a project in a workspace for a piece of work, before pushing its artifacts with project set. Choose restricted when only the people you add (and workspace admins) should see it.",
+    inputSchema: { type: "object", required: ["team", "name"], properties: { team: { type: "string", description: "Workspace address" }, name: { type: "string" }, brief: { type: "string", description: "What the project is for" }, access: { type: "string", enum: ["open", "restricted"] } } }
+  },
+  {
+    name: "get_project",
+    description: "Use this to read a project's settings and its people with their roles. Emails are shown only to people who manage the project.",
+    inputSchema: { type: "object", required: ["project"], properties: { project: { type: "string", description: "Project: team/slug (e.g. acme/q4-launch), or its id" } } }
+  },
+  {
+    name: "update_project",
+    description: "Use this to change a project: name, brief, access (open or restricted), address, archived, or its page (home: an artifact name or link, or none). Needs a project owner or workspace admin, except home, which editors can set too.",
+    inputSchema: { type: "object", required: ["project"], properties: { project: { type: "string", description: "Project: team/slug (e.g. acme/q4-launch), or its id" }, name: { type: "string" }, brief: { type: "string" }, access: { type: "string", enum: ["open", "restricted"] }, slug: { type: "string" }, archived: { type: "boolean" }, home: { type: "string", description: "Artifact to show as the project page, or none" } } }
+  },
+  {
+    name: "add_project_member",
+    description: "Use this to add someone to a project by email with a role. People outside the workspace become guests who see only this project. Confirm with the user before adding anyone outside their organisation.",
+    inputSchema: { type: "object", required: ["project", "email"], properties: { project: { type: "string", description: "Project: team/slug (e.g. acme/q4-launch), or its id" }, email: { type: "string" }, role: { type: "string", enum: ["viewer", "commenter", "editor", "owner"] } } }
+  },
+  {
+    name: "remove_project_member",
+    description: "Use this to remove someone from a project. They lose access to its artifacts at once.",
+    inputSchema: { type: "object", required: ["project", "email"], properties: { project: { type: "string", description: "Project: team/slug (e.g. acme/q4-launch), or its id" }, email: { type: "string" } } }
+  },
+  {
     name: "whoami",
     description:
       "Use this to confirm the user is signed in and which workspace will own a new artifact. Shows the account, the server, and where pushes land when no workspace is named.",
@@ -1420,6 +1530,20 @@ async function mcpTool(state, parsed, name, args, runtime = {}) {
   if (name === "list_artifacts") {
     requireToken(ctx);
     return listArtifacts(ctx, args);
+  }
+  if (["list_projects", "create_project", "get_project", "update_project", "add_project_member", "remove_project_member"].includes(name)) {
+    requireToken(ctx);
+    if (name === "list_projects") return listProjects(ctx, args);
+    if (name === "create_project") {
+      if (!args.team || !args.name) throw new CliError("`team` and `name` are required.");
+      return api(ctx, `/api/v1/teams/${encodeURIComponent(args.team)}/projects`, { method: "POST", body: { name: args.name, brief: args.brief, access: args.access === "restricted" ? "restricted" : "open" } });
+    }
+    const project = await resolveProject(ctx, args.project);
+    if (name === "get_project") return api(ctx, `/api/v1/projects/${encodeURIComponent(project.id)}`);
+    if (name === "update_project") return projectUpdate(ctx, project.id, args);
+    if (!args.email) throw new CliError("`email` is required.");
+    if (name === "add_project_member") return api(ctx, `/api/v1/projects/${encodeURIComponent(project.id)}/members`, { method: "POST", body: { email: args.email, role: args.role || "viewer" } });
+    return api(ctx, `/api/v1/projects/${encodeURIComponent(project.id)}/members/${encodeURIComponent(args.email)}`, { method: "DELETE" });
   }
   if (name === "list_artifact_comments") {
     requireToken(ctx);
@@ -1460,7 +1584,7 @@ async function mcpTool(state, parsed, name, args, runtime = {}) {
     } else {
       throw new CliError("Provide either `path`, or `content` plus `filename`.");
     }
-    return pushToServer(ctx, { doc, name: args.name || fallbackName, visibility: args.visibility, password: args.password });
+    return pushToServer(ctx, { doc, name: args.name || fallbackName, visibility: args.visibility, password: args.password, home: args.home === true });
   }
   throw new CliError(`Unknown tool: ${name}`);
 }
@@ -1580,9 +1704,15 @@ Commands:
   setup claude [--remove] [--dry-run]   # let Claude Code auto mode push to thing
   use <team> [project]
   default [team] [--clear]
-  push <file.html|.md|.pdf|.png|.jpg|.gif|.webp> [--name x] [--team t] [--project p] [--visibility private|team|public] [--password p] [--no-login] [--no-browser]
+  push <file.html|.md|.pdf|.png|.jpg|.gif|.webp> [--name x] [--team t] [--project p] [--home] [--visibility private|team|public] [--password p] [--no-login] [--no-browser]
   list [--team t] [--label l] [--search text] [--sort updated|created] [--order desc|asc] [--limit n] [--offset n]
   get <name|team/slug|link> [--version n] [--output file]   # read a version's source
+  projects [--team t]
+  project create <name> --team t [--restricted] [--brief text]
+  project show|delete <project>
+  project add <project> <email> [--role viewer|commenter|editor|owner]
+  project remove <project> <email>
+  project set <project> [--name n] [--brief b] [--access open|restricted] [--slug s] [--home <artifact>|none] [--archive|--restore]
   export --all [--output file] | export --team <slug>   # download everything in one zip
   comments <name>
   versions <name>
@@ -1656,6 +1786,12 @@ export async function run(argv = process.argv.slice(2), io = { stdout: process.s
         break;
       case "list":
         await list(parsed, state, io);
+        break;
+      case "projects":
+        await projectsCommand(parsed, state, io);
+        break;
+      case "project":
+        await projectCommand(parsed, state, io);
         break;
       case "comments":
         await commentsCommand(parsed, state, io);
