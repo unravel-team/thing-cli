@@ -109,11 +109,16 @@ repository/directory binding → the global `thing switch` selection → the onl
 saved account. `THING_TOKEN` and `THING_SERVER` still override stored
 credentials for CI and MCP configurations.
 
-### Team and project
+### Workspace and project
 
-Which team a push lands in is decided in order: `--team` flag → `.thing.json` in the
+A workspace (called a team in the API and the `--team` flag) holds your team's
+artifacts. A project groups artifacts inside a workspace and can be restricted to
+the people added to it; people from outside the workspace can be added to a project
+as guests. Push into one with `--project <slug>`.
+
+Which workspace a push lands in is decided in order: `--team` flag → `.thing.json` in the
 working directory → a local `thing use` override → your **server-side default**
-(`thing default`) → your personal space. Login no longer pins a team, so with none of
+(`thing default`) → your personal space. Login no longer pins a workspace, so with none of
 the overrides set the server picks your default (e.g. the Unravel org for Unravel members).
 
 ## MCP
