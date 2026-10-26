@@ -1268,10 +1268,10 @@ const MCP_TOOLS = [
         content: { type: "string", description: "Inline document text (HTML or Markdown) — use with filename" },
         filename: { type: "string", description: "Filename for inline content, e.g. report.html or notes.md" },
         name: { type: "string", description: "Artifact name (defaults to the filename)" },
-        team: { type: "string", description: "Team slug to push to (defaults to the user's default team)" },
-        project: { type: "string", description: "Project slug" },
-        visibility: { type: "string", enum: ["private", "team", "public"], description: "Who can see it: private is only you and people you add, team is everyone in the org, public is anyone with the link" },
-        password: { type: "string", description: "Set a password; anyone who knows it can open the artifact beside team and people access" }
+        team: { type: "string", description: "Workspace address to push to (a workspace is called a team in the API; defaults to the user's default workspace)" },
+        project: { type: "string", description: "Project slug in that workspace. Restricted projects are seen only by their members and workspace admins; guests from outside the workspace can push only into projects where they are editors" },
+        visibility: { type: "string", enum: ["private", "team", "public"], description: "Who can see it: private is only you and people you add, team is everyone in the workspace (or, in a project, the project's people), public is anyone with the link" },
+        password: { type: "string", description: "Set a password; anyone who knows it can open the artifact beside workspace and people access" }
       }
     }
   },
@@ -1367,7 +1367,7 @@ const MCP_TOOLS = [
   {
     name: "whoami",
     description:
-      "Use this to confirm the user is signed in and which team will own a new artifact. Shows the account, the server, and where pushes land when no team is named.",
+      "Use this to confirm the user is signed in and which workspace will own a new artifact. Shows the account, the server, and where pushes land when no workspace is named.",
     inputSchema: { type: "object", properties: {} }
   }
 ];
@@ -1564,6 +1564,7 @@ Commands:
   open <name>
 
   <name> may also be team/slug or a link, including /v/N and ?k= links.
+  --team takes a workspace's address (workspaces are called teams in the API).
   mcp [--version]         # Model Context Protocol server over stdio
 
 Global options:
